@@ -1,8 +1,7 @@
 import torch
-from src.team_trainer import DiscreteInputTrainer
-from src.language_replay_buffer import ReplayBufferDiskStorage
-from src.coevolver import CaptianCoevolution
-from coevolution_tests.rps_dual.game import DualPairOutcome
+from BERTeam.trainer import DiscreteInputTrainer
+from BERTeam.buffer import ReplayBufferDiskStorage
+
 import numpy as np
 import itertools
 
@@ -51,13 +50,14 @@ def dist_from_trainer(trainer: DiscreteInputTrainer,
 
 if __name__ == '__main__':
     import os, sys
-    from coevolution_tests.rps_basic.teams import plot_dist_evolution, loss_plot
+    from BERTeam.tests.rps_basic.teams import plot_dist_evolution, loss_plot
+    from BERTeam.tests.rps_dual.game import DualPairOutcome
     import time
 
     torch.random.manual_seed(69)
     agents = torch.arange(3)
 
-    DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.join(os.getcwd(), sys.argv[0]))))
+    DIR = os.getcwd()
     plot_dir = os.path.join(DIR, 'data', 'plots', 'tests_rps2_teams')
     if not os.path.exists((plot_dir)):
         os.makedirs(plot_dir)
@@ -76,12 +76,6 @@ if __name__ == '__main__':
                                        device=None,
                                    ),
                                    )
-    coevolver = CaptianCoevolution(outcome_fn_gen=lambda: DualPairOutcome(agents=agents),
-                                   population_sizes=[3],
-                                   team_trainer=trainer,
-                                   clone_fn=None,
-                                   team_sizes=(2, 2),
-                                   )
 
     N = 100
     minibatch = 64
@@ -89,11 +83,17 @@ if __name__ == '__main__':
     cond_dists = []
     strat_labels = ['RR', 'PP', 'SS', 'RP', 'RS', 'PS']
     losses = []
+    outcome = DualPairOutcome()
     for epoch in range(100):
         start_time = time.time()
         noise = trainer.create_nose_model_towards_uniform(1/np.sqrt(epoch/2 + 1))
-        coevolver.set_noise_model(noise_model=noise)
-        coevolver.epoch(rechoose=False)
+        game = trainer.create_teams(T=2, N=2, noise_model=noise)
+
+
+        trainer.buffer.add_outcome(teams=game,
+                                   outcome=outcome.get_outcome(team_choices=game),
+                                   filter=lambda score: score > .5,
+                                   )
 
         init_distribution = dist_from_trainer(trainer=trainer,
                                               input_preembedding=None,
@@ -114,7 +114,7 @@ if __name__ == '__main__':
 
         collection_time = time.time() - start_time
         start_time = time.time()
-        loss = trainer.training_step(batch_size=minibatch, sgd=False)
+        loss = trainer.training_step(batch_size=minibatch)
         losses.append(loss)
 
         print('epoch', epoch, ';\tbuffer size', len(trainer.buffer))
@@ -140,4 +140,4 @@ if __name__ == '__main__':
             print('\tplot time:', round(time.time() - start_time, 2))
         epoch += 1
         print()
-    trainer.buffer.clear()
+    trainer.clear()

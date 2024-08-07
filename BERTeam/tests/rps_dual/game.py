@@ -1,6 +1,6 @@
 import torch
 from matplotlib import pyplot as plt
-from src.game_outcome import PlayerInfo, OutcomeFn
+from BERTeam.outcome import PlayerInfo, OutcomeFn
 
 ROCK = 0
 PAPER = 1
@@ -9,7 +9,7 @@ SCISOR = 2
 
 def double_game_outcome(a, b):
     # ['RR', 'PP', 'SS', 'RP', 'RS', 'PS']
-    a,b=int(a),int(b)
+    a, b = int(a), int(b)
 
     if a < 3 and b < 3:
         if a == b:
@@ -40,9 +40,10 @@ def double_game_outcome(a, b):
 
 class DualPreMappedOutcome(OutcomeFn):
     def __init__(self, agents):
+        super().__init__()
         self.agents = agents
 
-    def get_outcome(self, team_choices, updated_train_infos=None, env=None):
+    def get_outcome(self, team_choices, **kwargs):
         result = double_game_outcome(team_choices[0], team_choices[1])
         if result == 0:
             return [(.5, [PlayerInfo(obs_preembed=team_choices[1]),
@@ -65,8 +66,6 @@ class DualPreMappedOutcome(OutcomeFn):
 
 
 class DualPairOutcome(OutcomeFn):
-    def __init__(self, agents):
-        self.agents = agents
 
     def map_to_number(self, team):
         # ['RR', 'PP', 'SS', 'RP', 'RS', 'PS']
@@ -80,7 +79,7 @@ class DualPairOutcome(OutcomeFn):
             return torch.tensor(5)
         return torch.tensor(4)
 
-    def get_outcome(self, team_choices, updated_train_infos=None, env=None):
+    def get_outcome(self, team_choices, **kwargs):
         result = double_game_outcome(self.map_to_number(team_choices[0]),
                                      self.map_to_number(team_choices[1]),
                                      )
@@ -113,4 +112,4 @@ if __name__ == '__main__':
     print(outcomes.get_outcome(team_choices=(torch.tensor([3]), torch.tensor([2]))))
     print()
     outcomes = DualPairOutcome(agents=agents)
-    print(outcomes.get_outcome(team_choices=(torch.tensor([2,1]), torch.tensor([1,1]))))
+    print(outcomes.get_outcome(team_choices=(torch.tensor([2, 1]), torch.tensor([1, 1]))))
