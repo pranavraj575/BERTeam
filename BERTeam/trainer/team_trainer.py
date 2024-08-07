@@ -1,4 +1,4 @@
-import torch, os, shutil
+import torch, os
 from torch import nn
 from torch.utils.data import DataLoader
 
