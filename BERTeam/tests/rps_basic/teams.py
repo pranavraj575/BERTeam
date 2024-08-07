@@ -74,7 +74,7 @@ if __name__ == '__main__':
                                                 )
             conditional_dists.append(dist.detach().flatten().numpy())
         cond_dists.append(conditional_dists)
-        loss = trainer.training_step(batch_size=minibatch)
+        loss = trainer.train(batch_size=minibatch)
         losses.append(loss)
         print('epoch', epoch, ';\tbuffer size', len(trainer.buffer))
         print('loss', loss)

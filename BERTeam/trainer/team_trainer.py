@@ -334,15 +334,20 @@ class MLMTeamTrainer(TeamTrainer):
               ):
         if minibatch is None:
             minibatch = batch_size
+        loss = 0
         for i in range(0, batch_size, minibatch):
             tinybatch = min(i + minibatch, batch_size) - i
             # cut off the last batch if we go over
-            self.training_step(
+            step_loss = self.training_step(
                 batch_size=tinybatch,
                 mask_probs=mask_probs,
                 replacement_probs=replacement_probs,
                 mask_obs_prob=mask_obs_prob,
             )
+            loss += tinybatch*step_loss
+        # clear any remaining gradient from memory
+        self.optim.zero_grad()
+        return loss/batch_size
 
     def training_step(self,
                       batch_size,
@@ -781,6 +786,7 @@ class DiscreteInputTrainer(MLMTeamTrainer):
                 input_embedder=input_embedder,
             )
         )
+
 
 if __name__ == '__main__':
     from matplotlib import pyplot as plt

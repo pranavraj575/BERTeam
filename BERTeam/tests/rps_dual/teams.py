@@ -114,7 +114,7 @@ if __name__ == '__main__':
 
         collection_time = time.time() - start_time
         start_time = time.time()
-        loss = trainer.training_step(batch_size=minibatch)
+        loss = trainer.train(batch_size=minibatch)
         losses.append(loss)
 
         print('epoch', epoch, ';\tbuffer size', len(trainer.buffer))
