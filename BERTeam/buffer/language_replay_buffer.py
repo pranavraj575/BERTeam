@@ -135,6 +135,7 @@ class ReplayBufferDiskStorage(LangReplayBuffer):
         os.makedirs(self.storage_dir)
         self.size = 0
         self.idx = 0
+        self.save_place()
 
     def save_place(self):
         """
