@@ -334,6 +334,9 @@ class MLMTeamTrainer(TeamTrainer):
               ):
         if minibatch is None:
             minibatch = batch_size
+        if not len(self.buffer):
+            print('WARNING: trying to train on empty buffer')
+            return None
         loss = 0
         for i in range(0, batch_size, minibatch):
             tinybatch = min(i + minibatch, batch_size) - i
@@ -347,6 +350,10 @@ class MLMTeamTrainer(TeamTrainer):
             loss += tinybatch*step_loss
         # clear any remaining gradient from memory
         self.optim.zero_grad()
+
+        # torch.clear_autocast_cache()
+        # if torch.cuda.is_available():
+        #    torch.cuda.empty_cache()
         return loss/batch_size
 
     def training_step(self,
