@@ -14,7 +14,7 @@ class TeamTrainer:
         self.num_agents = num_agents
         self.MASK = MASK
 
-    def set_storage_dir(self, storage_dir):
+    def reset_storage_dir(self, storage_dir):
         pass
 
     def clear(self):
@@ -292,12 +292,12 @@ class MLMTeamTrainer(TeamTrainer):
         self.buffer = buffer
 
         if storage_dir is not None:
-            self.set_storage_dir(storage_dir=storage_dir)
+            self.reset_storage_dir(storage_dir=storage_dir)
 
         self.optim = torch.optim.Adam(team_builder.parameters())
 
-    def set_storage_dir(self, storage_dir):
-        self.buffer.set_storage_dir(storage_dir=os.path.join(storage_dir, 'buffer'), reset=True)
+    def reset_storage_dir(self, storage_dir):
+        self.buffer.reset_storage_dir(storage_dir=os.path.join(storage_dir, 'buffer'))
 
     def clear(self):
         """

@@ -6,12 +6,11 @@ from BERTeam.outcome import PlayerInfo
 class LangReplayBuffer:
     storage_dir = None
 
-    def set_storage_dir(self, storage_dir, reset=False):
+    def reset_storage_dir(self, storage_dir):
         self.storage_dir = storage_dir
         if not os.path.exists(storage_dir):
             os.makedirs(storage_dir)
-        if reset:
-            self.reset_storage()
+        self.reset_storage()
 
     def reset_storage(self):
         """
@@ -110,7 +109,7 @@ class ReplayBufferDiskStorage(LangReplayBuffer):
         self.capacity = capacity
         self.device = device
         if storage_dir is not None:
-            self.set_storage_dir(storage_dir=storage_dir)
+            self.reset_storage_dir(storage_dir=storage_dir)
 
     def clear(self):
         super().clear()
@@ -215,7 +214,6 @@ class BinnedReplayBufferDiskStorage(LangReplayBuffer):
                  bounds=None,
                  capacity=1e6,
                  device=None,
-                 overwrite_existing=True,
                  ):
         """
         Args:
@@ -229,8 +227,6 @@ class BinnedReplayBufferDiskStorage(LangReplayBuffer):
                     This is intended for a 2 player game where we want to capture outcomes that are better than ties
                         Usually, in an n-player game, the bounds should range [1/n,...,1] to capture outcomes that are
                             better than ties
-            overwrite_existing: whether to overwrite existing storage
-
         """
         super().__init__()
         if bounds is None:
@@ -246,14 +242,13 @@ class BinnedReplayBufferDiskStorage(LangReplayBuffer):
             'size': 0,
         }
         if storage_dir is not None:
-            self.set_storage_dir(storage_dir=storage_dir, reset=overwrite_existing)
+            self.reset_storage_dir(storage_dir=storage_dir)
         self.weights = None
 
-    def set_storage_dir(self, storage_dir, reset=False):
-        super().set_storage_dir(storage_dir=storage_dir, reset=reset)
+    def reset_storage_dir(self, storage_dir):
+        super().reset_storage_dir(storage_dir=storage_dir)
         for i, biin in enumerate(self.bins):
-            biin.set_storage_dir(storage_dir=os.path.join(storage_dir, 'bin_' + str(i)),
-                                 reset=reset)
+            biin.reset_storage_dir(storage_dir=os.path.join(storage_dir, 'bin_' + str(i)))
 
     def reset_storage(self):
         self.clear()
