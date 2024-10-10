@@ -468,9 +468,9 @@ class BinnedReplayBufferDiskStorage(LangReplayBuffer):
         """
         if item >= self.size:
             raise IndexError
-        for biin in self.bins:
+        for bindex, biin in enumerate(self.bins):
             if item < biin.size:
-                return self.get_output_item(item=biin[item], bindex=item)
+                return self.get_output_item(item=biin[item], bindex=bindex)
             item -= biin.size
 
     @property
