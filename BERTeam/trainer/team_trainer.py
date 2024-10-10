@@ -156,24 +156,24 @@ class TeamTrainer:
                 if None, just calls mutate_add_member (T) times
             valid_members: (N,T,num_agents) boolean array of which agents are valid for which locations
         Returns:
-            filled in teams of size (N,T), formation probability, noiseless foramtion probability
+            filled in teams of size (N,T), log formation probability, log noiseless foramtion probability
         """
         N, T = initial_teams.shape
         if num_masks is None:
             num_masks = T
-        formation_prob = torch.tensor(1.)
-        og_formation_prob = torch.tensor(1.)
+        log_formation_prob = torch.tensor(0.)
+        og_log_formation_prob = torch.tensor(0.)
         for _ in range(num_masks):
-            initial_teams, fp, ofp = self.mutate_add_member(
+            initial_teams, lfp, lofp = self.mutate_add_member(
                 initial_teams=initial_teams,
                 indices=None,
                 noise_model=noise_model,
                 valid_members=valid_members,
                 **kwargs,
             )
-            formation_prob = formation_prob*fp
-            og_formation_prob = og_formation_prob*ofp
-        return initial_teams, formation_prob, og_formation_prob
+            log_formation_prob = log_formation_prob + lfp
+            og_log_formation_prob = og_log_formation_prob + lofp
+        return initial_teams, log_formation_prob, og_log_formation_prob
 
     def mutate_add_member(self,
                           initial_teams,
@@ -209,7 +209,7 @@ class TeamTrainer:
                 #    print("warning: tried to add to full team")
         if len(indices[0]) == 0:
             # no [MASK] tokens exist
-            return initial_teams
+            return initial_teams, torch.tensor(0.), torch.tensor(0.)
         og_dist = torch.ones((N, T, self.num_agents))/self.num_agents
 
         if noise_model is not None:
@@ -233,9 +233,9 @@ class TeamTrainer:
                                    replacement=True,
                                    ).flatten()
         initial_teams[indices] = result
-        formation_probability = torch.prod(dist[indices[0], indices[1], result]).detach()
-        og_formation_probability = torch.prod(og_dist[indices[0], indices[1], result]).detach()
-        return initial_teams, formation_probability, og_formation_probability
+        log_formation_probability = torch.sum(torch.log(dist[indices[0], indices[1], result])).detach()
+        log_og_formation_probability = torch.sum(torch.log(og_dist[indices[0], indices[1], result])).detach()
+        return initial_teams, log_formation_probability, log_og_formation_probability
 
     def create_masked_teams(self, T, N=1):
         """
@@ -694,7 +694,7 @@ class MLMTeamTrainer(TeamTrainer):
         if indices is None:
             indices = torch.where(torch.eq(init_team, self.MASK))
         if len(indices[0]) == 0:
-            return None, None, None
+            return None, torch.tensor(1.), torch.tensor(1.)
         output = self.team_builder.forward(obs_preembed=obs_preembed,
                                            target_team=init_team,
                                            obs_mask=obs_mask,
@@ -752,7 +752,7 @@ class MLMTeamTrainer(TeamTrainer):
                 #    print("warning: tried to add to full team")
         if len(indices[0]) == 0:
             # no [MASK] tokens exist
-            return initial_teams
+            return initial_teams, torch.tensor(0.), torch.tensor(0.)
         indices, dist, og_dist = self.get_member_distribution(init_team=initial_teams,
                                                               indices=indices,
                                                               obs_preembed=obs_preembed,
@@ -767,9 +767,9 @@ class MLMTeamTrainer(TeamTrainer):
                                    replacement=True,
                                    ).flatten()
         initial_teams[indices] = result
-        formation_probability = torch.prod(dist[range(len(dist)), result]).detach()
-        og_formation_probability = torch.prod(og_dist[range(len(og_dist)), result]).detach()
-        return initial_teams, formation_probability, og_formation_probability
+        log_formation_probability = torch.sum(torch.log(dist[range(len(dist)), result])).detach()
+        log_og_formation_probability = torch.sum(torch.log(og_dist[range(len(og_dist)), result])).detach()
+        return initial_teams, log_formation_probability, log_og_formation_probability
 
 
 class DiscreteInputTrainer(MLMTeamTrainer):
