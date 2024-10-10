@@ -29,7 +29,7 @@ class TeamTrainer:
     def load(self, save_dir):
         pass
 
-    def add_to_buffer(self, scalar, obs_preembed, team, obs_mask):
+    def add_to_buffer(self, scalar, obs_preembed, team, obs_mask, weight=1.):
         """
         adds element to language replay buffer
         Args:
@@ -321,8 +321,8 @@ class MLMTeamTrainer(TeamTrainer):
         self.team_builder.load_state_dict(dic['model'])
         self.optim.load_state_dict(dic['optim'])
 
-    def add_to_buffer(self, scalar, obs_preembed, team, obs_mask):
-        item = (scalar, obs_preembed, team, obs_mask)
+    def add_to_buffer(self, scalar, obs_preembed, team, obs_mask, weight=1.):
+        item = (scalar, obs_preembed, team, obs_mask, weight)
         self.buffer.push(item=item)
 
     def train(self,
@@ -384,7 +384,7 @@ class MLMTeamTrainer(TeamTrainer):
         self.optim.zero_grad()
         losses = torch.zeros(1)
         count = 0
-        for (scalar, obs_preembed, team, obs_mask) in data:
+        for (scalar, obs_preembed, team, obs_mask, weight) in data:
             team = team.view((1, -1))
             if torch.is_tensor(obs_preembed) and torch.all(torch.isnan(obs_preembed)):
                 obs_preembed = None
@@ -404,7 +404,7 @@ class MLMTeamTrainer(TeamTrainer):
                                         mask_obs_prob=mask_obs_prob,
                                         )
             # keep gradients
-            losses += loss
+            losses += loss*weight
             count += 1
         mean_loss = losses/count
         mean_loss.backward()
