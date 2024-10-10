@@ -694,7 +694,7 @@ class MLMTeamTrainer(TeamTrainer):
         if indices is None:
             indices = torch.where(torch.eq(init_team, self.MASK))
         if len(indices[0]) == 0:
-            return None, None
+            return None, None, None
         output = self.team_builder.forward(obs_preembed=obs_preembed,
                                            target_team=init_team,
                                            obs_mask=obs_mask,
