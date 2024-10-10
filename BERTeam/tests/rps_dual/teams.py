@@ -87,8 +87,7 @@ if __name__ == '__main__':
     for epoch in range(100):
         start_time = time.time()
         noise = trainer.create_nose_model_towards_uniform(1/np.sqrt(epoch/2 + 1))
-        game = trainer.create_teams(T=2, N=2, noise_model=noise)
-
+        game, _, _ = trainer.create_teams(T=2, N=2, noise_model=noise)
 
         trainer.buffer.add_outcome(teams=game,
                                    outcome=outcome.get_outcome(team_choices=game),

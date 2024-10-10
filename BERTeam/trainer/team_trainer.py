@@ -58,6 +58,7 @@ class TeamTrainer:
     def get_member_distribution(self,
                                 init_team,
                                 indices=None,
+                                noise_model=None,
                                 **kwargs
                                 ):
         """
@@ -73,7 +74,13 @@ class TeamTrainer:
         if indices is None:
             indices = torch.where(torch.eq(init_team, self.MASK))
 
-        return indices, torch.ones((len(indices[0]), self.num_agents))/self.num_agents
+        og_dist = torch.ones((len(indices[0]), self.num_agents))/self.num_agents
+        if noise_model is not None:
+            # add noise if this is a thing
+            dist = noise_model(og_dist)
+        else:
+            dist = og_dist.clone()
+        return indices, dist, og_dist
 
     def add_member_to_team(self,
                            member,
@@ -116,8 +123,9 @@ class TeamTrainer:
         conditional_dist[torch.where(torch.not_equal(init_team, self.MASK))] = 0
         if valid_locations is not None:
             conditional_dist = conditional_dist*valid_locations  # sets invalid locations to 0
+            conditional_dist = conditional_dist/torch.sum(conditional_dist, dim=-1, keepdim=True)
 
-        valid_indices = torch.where(torch.sum(conditional_dist, axis=1) > 0)[0]
+        valid_indices = torch.where(torch.sum(conditional_dist, dim=1) > 0)[0]
         if len(valid_indices) == 0:
             # there are no mask tokens, or the conditional distribution is all zeros
             return init_team
@@ -148,19 +156,24 @@ class TeamTrainer:
                 if None, just calls mutate_add_member (T) times
             valid_members: (N,T,num_agents) boolean array of which agents are valid for which locations
         Returns:
-            filled in teams of size (N,T)
+            filled in teams of size (N,T), formation probability, noiseless foramtion probability
         """
         N, T = initial_teams.shape
         if num_masks is None:
             num_masks = T
+        formation_prob = torch.tensor(1.)
+        og_formation_prob = torch.tensor(1.)
         for _ in range(num_masks):
-            initial_teams = self.mutate_add_member(initial_teams=initial_teams,
-                                                   indices=None,
-                                                   noise_model=noise_model,
-                                                   valid_members=valid_members,
-                                                   **kwargs,
-                                                   )
-        return initial_teams
+            initial_teams, fp, ofp = self.mutate_add_member(
+                initial_teams=initial_teams,
+                indices=None,
+                noise_model=noise_model,
+                valid_members=valid_members,
+                **kwargs,
+            )
+            formation_prob = formation_prob*fp
+            og_formation_prob = og_formation_prob*ofp
+        return initial_teams, formation_prob, og_formation_prob
 
     def mutate_add_member(self,
                           initial_teams,
@@ -182,7 +195,7 @@ class TeamTrainer:
             noise_model: noise to add to probability distribution, if None, doesnt add noise
             valid_members: (N,T,num_agents) boolean array of which agents are valid for which locations
         Returns:
-            team with updates
+            team with updates, formation probability, noiseless foramtion probability
         """
         N, T = initial_teams.shape
         if indices is None:
@@ -197,21 +210,32 @@ class TeamTrainer:
         if len(indices[0]) == 0:
             # no [MASK] tokens exist
             return initial_teams
-        dist = torch.ones((N, T, self.num_agents))/self.num_agents
+        og_dist = torch.ones((N, T, self.num_agents))/self.num_agents
 
         if noise_model is not None:
             # add noise if this is a thing
-            dist = noise_model(dist)
+            dist = noise_model(og_dist)
+        else:
+            dist = og_dist.clone()
 
         if valid_members is not None:
             dist = dist*valid_members
+            dist = dist/torch.sum(dist, dim=-1, keepdim=True)
+
+            og_dist = og_dist*valid_members
+            og_dist = og_dist/torch.sum(og_dist, dim=-1, keepdim=True)
         # just look at the relevant indices
         dist = dist[indices]
 
         # torch.multinomial samples each
-
-        initial_teams[indices] = torch.multinomial(dist, 1).flatten()
-        return initial_teams
+        result = torch.multinomial(dist,
+                                   len(indices[0]),
+                                   replacement=True,
+                                   ).flatten()
+        initial_teams[indices] = result
+        formation_probability = torch.prod(dist[result]).detach()
+        og_formation_probability = torch.prod(og_dist[result]).detach()
+        return initial_teams, formation_probability, og_formation_probability
 
     def create_masked_teams(self, T, N=1):
         """
@@ -266,9 +290,9 @@ class TeamTrainer:
             obs_mask: size (N,S) boolean array of whether to mask each input embedding
             noise_model: noise to add to probability distribution, if None, doesnt add noise
         Returns:
-            filled in teams of size (N,T)
+            filled in teams of size (N,T), formation probability, noiseless foramtion probability
         """
-        return self.uniform_random_team(shape=(N, T))
+        return self.uniform_random_team(shape=(N, T)), torch.tensor(1/N*T), torch.tensor(1/N*T)
 
 
 class MLMTeamTrainer(TeamTrainer):
@@ -370,9 +394,6 @@ class MLMTeamTrainer(TeamTrainer):
                     for each obtained team size
             replacement_probs: proportion of ([MASK], random element, same element) to replace masked elements with
                 default (.8, .1, .1) because BERT
-            scalar: thing to multiply losses
-                should be 1 for normal MLM training
-                    -1 to push model away from 'bad' teamas
             mask_obs_prob: if >0, randomly masks observations with this probability as well
         Returns:
             avg losses for whole dataset
@@ -426,8 +447,7 @@ class MLMTeamTrainer(TeamTrainer):
             obs_preembed: tensor (N, S, *) of input preembeddings, or None if no preembeddings
             teams: tensor (N, T) of teams
             obs_mask: boolean tensor (N, S) of whether to pad each input
-            mask_probs: list of proabilities of masking to use
-                if None, uses (1/team_size, 2/team_size, ..., 1)
+            mask_prob: probabilty of masking to use
             replacement_probs: proportion of ([MASK], random element, same element) to replace masked elements with
                 default (.8, .1, .1) because BERT
             mask_obs_prob: if >0, randomly mask observations with this prob
@@ -574,8 +594,9 @@ class MLMTeamTrainer(TeamTrainer):
         conditional_dist[torch.where(init_team != self.MASK)] = 0
         if valid_locations is not None:
             conditional_dist = conditional_dist*valid_locations
+            conditional_dist = conditional_dist/torch.sum(conditional_dist, dim=-1, keepdim=True)
 
-        valid_indices = torch.where(torch.sum(conditional_dist, axis=1) > 0)[0]
+        valid_indices = torch.where(torch.sum(conditional_dist, dim=1) > 0)[0]
         if len(valid_indices) == 0:
             # there are no mask tokens, or the conditional distribution is all zeros
             return init_team
@@ -604,7 +625,7 @@ class MLMTeamTrainer(TeamTrainer):
             obs_mask: size (N,S) boolean array of whether to mask each input embedding
             noise_model: noise to add to probability distribution, if None, doesnt add noise
         Returns:
-            filled in teams of size (N,T)
+            filled in teams of size (N,T), formation probability, noiseless foramtion probability
         """
         return self.fill_in_teams(initial_teams=self.create_masked_teams(T=T, N=N),
                                   obs_preembed=obs_preembed,
@@ -616,7 +637,7 @@ class MLMTeamTrainer(TeamTrainer):
                                T,
                                N=1,
                                init_team=None,
-                               prob=1,
+                               prob=torch.tensor(1.),
                                tracked=None,
                                obs_preembed=None,
                                obs_mask=None,
@@ -628,13 +649,13 @@ class MLMTeamTrainer(TeamTrainer):
         if tracked is None:
             tracked = dict()
 
-        indices, dist = self.get_member_distribution(init_team=init_team,
-                                                     indices=None,
-                                                     obs_preembed=obs_preembed,
-                                                     obs_mask=obs_mask,
-                                                     noise_model=noise_model,
-                                                     valid_members=valid_members,
-                                                     )
+        indices, dist, og_dist = self.get_member_distribution(init_team=init_team,
+                                                              indices=None,
+                                                              obs_preembed=obs_preembed,
+                                                              obs_mask=obs_mask,
+                                                              noise_model=noise_model,
+                                                              valid_members=valid_members,
+                                                              )
         if indices is None:
             obj = tuple(init_team.detach().numpy().flatten())
             if obj not in tracked:
@@ -681,15 +702,20 @@ class MLMTeamTrainer(TeamTrainer):
                                            pre_softmax=False,
                                            )
 
-        dist = output[indices]  # (|indices|, num_agents) multinomial distribution for each index to update
+        og_dist = output[indices]  # (|indices|, num_agents) multinomial distribution for each index to update
         if noise_model is not None:
             # add noise if this is a thing
-            dist = noise_model(dist)
-
+            dist = noise_model(og_dist)
+        else:
+            dist = og_dist.clone()
         if valid_members is not None:
             # set invalid members to 0
             dist = dist*(valid_members[indices])
-        return indices, dist
+            dist = dist/torch.sum(dist, dim=-1, keepdim=True)
+
+            og_dist = og_dist*(valid_members[indices])
+            og_dist = og_dist/torch.sum(og_dist, dim=-1, keepdim=True)
+        return indices, dist.detach(), og_dist.detach()
 
     def mutate_add_member(self,
                           initial_teams,
@@ -712,7 +738,7 @@ class MLMTeamTrainer(TeamTrainer):
             noise_model: noise to add to probability distribution, if None, doesnt add noise
             valid_members: (N,T,num_agents) boolean array of which agents are valid for which locations
         Returns:
-            team with updates
+            team with updates, formation probability, noiseless foramtion probability
         """
         N, T = initial_teams.shape
         if indices is None:
@@ -727,17 +753,23 @@ class MLMTeamTrainer(TeamTrainer):
         if len(indices[0]) == 0:
             # no [MASK] tokens exist
             return initial_teams
-        indices, dist = self.get_member_distribution(init_team=initial_teams,
-                                                     indices=indices,
-                                                     obs_preembed=obs_preembed,
-                                                     obs_mask=obs_mask,
-                                                     noise_model=noise_model,
-                                                     valid_members=valid_members
-                                                     )
+        indices, dist, og_dist = self.get_member_distribution(init_team=initial_teams,
+                                                              indices=indices,
+                                                              obs_preembed=obs_preembed,
+                                                              obs_mask=obs_mask,
+                                                              noise_model=noise_model,
+                                                              valid_members=valid_members
+                                                              )
 
         # torch.multinomial samples each
-        initial_teams[indices] = torch.multinomial(dist, 1).flatten()
-        return initial_teams
+        result = torch.multinomial(dist,
+                                   len(indices[0]),
+                                   replacement=True,
+                                   ).flatten()
+        initial_teams[indices] = result
+        formation_probability = torch.prod(dist[result]).detach()
+        og_formation_probability = torch.prod(og_dist[result]).detach()
+        return initial_teams, formation_probability, og_formation_probability
 
 
 class DiscreteInputTrainer(MLMTeamTrainer):
