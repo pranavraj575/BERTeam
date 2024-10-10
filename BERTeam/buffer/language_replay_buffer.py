@@ -103,11 +103,27 @@ class ReplayBufferDiskStorage(LangReplayBuffer):
                  storage_dir=None,
                  capacity=1e6,
                  device=None,
+                 track_age=False,
+                 count_capacity=1e12,
                  ):
+        """
+        Args:
+            track_age: if True, when sampling, returns (item, age)
+        """
         self.idx = 0
         self.size = 0
         self.capacity = capacity
         self.device = device
+
+        self.track_age = track_age
+        self.time_cnt = 0
+        self.parity = True
+        self.reset_time = self.capacity
+        self.count_capacity = count_capacity
+
+        # count capacity should be MUCH bigger, but this should work as long as we dont tick too large
+        assert self.count_capacity > self.capacity
+
         if storage_dir is not None:
             self.reset_storage_dir(storage_dir=storage_dir)
 
@@ -144,6 +160,9 @@ class ReplayBufferDiskStorage(LangReplayBuffer):
             {
                 'size': self.size,
                 'idx': self.idx,
+                'track_age': self.track_age,
+                'time_cnt': self.time_cnt,
+                'parity': self.parity,
             },
             open(self._get_file('info'), 'wb')
         )
@@ -154,6 +173,9 @@ class ReplayBufferDiskStorage(LangReplayBuffer):
             dic = pickle.load(open(info_file, 'rb'))
             self.size = dic['size']
             self.idx = dic['idx']
+            self.track_age = dic['track_age']
+            self.time_cnt = dic['time_cnt']
+            self.parity = dic['parity']
         else:
             if force:
                 print('failed to load file:', info_file)
@@ -165,11 +187,12 @@ class ReplayBufferDiskStorage(LangReplayBuffer):
     def _get_file(self, name):
         return os.path.join(self.storage_dir, str(name) + '.pkl')
 
-    def push(self, item):
+    def push(self, item, age_tick=1):
         if self.size == self.capacity:
             disp = self.__getitem__(self.idx)
         else:
             disp = None
+        item = self.change_item_to_new_youngest(item=item, age_tick=age_tick)
         pickle.dump(item, open(self._get_file(self.idx), 'wb'))
 
         self.size = max(self.idx + 1, self.size)
@@ -197,10 +220,57 @@ class ReplayBufferDiskStorage(LangReplayBuffer):
     def __getitem__(self, item):
         if item >= self.size:
             raise IndexError
-        return self._grab_item_by_idx(idx=int((self.idx + item)%self.size))
+        return self.get_output_item(self._grab_item_by_idx(idx=int((self.idx + item)%self.size)))
 
     def __len__(self):
         return self.size
+
+    def change_item_to_new_youngest(self, item, age_tick=1):
+        """
+        updates oldest and parity
+        Returns:
+            item, birthday storage tuple
+            or item if not self.track_age
+        """
+        if self.track_age:
+            self.time_cnt += age_tick
+            if self.parity:
+                item = item, (-1, self.time_cnt)
+            else:
+                item = item, (self.time_cnt, -1)
+            if self.time_cnt >= self.count_capacity:
+                # switch parity, reset age
+                # do this to prevent overflow for particularly long experiments
+                self.parity = not self.parity
+                # time when we reset, usually self.count_capacity
+                self.reset_time = self.time_cnt
+
+                self.time_cnt = 0
+            return item
+        else:
+            return item
+
+    def get_output_item(self, item):
+        """
+        takes an item in storage, returns item to output
+        if self.track_age is false, does nothing
+        otherwise finds true age of item
+        """
+        if self.track_age:
+            item, birth_tup = item
+            if birth_tup[self.parity] == -1:
+                # in this case, the age until the parity swap will be self.capacity-birth_tup[not self.parity]
+                # we then add to this self.oldest
+                age = self.time_cnt + (self.reset_time - birth_tup[not self.parity])
+            else:
+                age = self.time_cnt - birth_tup[self.parity]
+            if age < 0:
+                # this only happens if we made count capacity too low, and at least two swaps happened in recent memory
+                # just add a bunch to age and call it a day
+                age = 2*self.count_capacity
+            return item, age
+        else:
+            return item
 
 
 class BinnedReplayBufferDiskStorage(LangReplayBuffer):
@@ -214,6 +284,8 @@ class BinnedReplayBufferDiskStorage(LangReplayBuffer):
                  bounds=None,
                  capacity=1e6,
                  device=None,
+                 track_age=False,
+                 count_capacity=1e12,
                  ):
         """
         Args:
@@ -233,17 +305,22 @@ class BinnedReplayBufferDiskStorage(LangReplayBuffer):
             bounds = [1/2, 1]
         self.bins = [ReplayBufferDiskStorage(storage_dir=None,
                                              capacity=capacity,
-                                             device=device)
+                                             device=device,
+                                             track_age=track_age,
+                                             count_capacity=count_capacity,
+                                             )
                      for i in range(len(bounds) - 1)
                      ]
         self.info = {
             'bounds': tuple(bounds),
             'avgs': torch.zeros(len(bounds) - 1),
             'size': 0,
+            'buffer ages': [0 for _ in self.bins],  # keep track of how long ago each buffer was pushed to
         }
         if storage_dir is not None:
             self.reset_storage_dir(storage_dir=storage_dir)
         self.weights = None
+        self.track_age = track_age
 
     def reset_storage_dir(self, storage_dir):
         super().reset_storage_dir(storage_dir=storage_dir)
@@ -300,16 +377,21 @@ class BinnedReplayBufferDiskStorage(LangReplayBuffer):
 
     def push(self, item):
         scalar = item[0]
-        biin = self.bin_search(scalar)
-        if biin is not None:
-            disp = self.bins[biin].push(item)
+        bindex = self.bin_search(scalar)
+        if bindex is not None:
+            if self.track_age:
+                disp = self.bins[bindex].push(item, age_tick=1 + self.info['buffer ages'][bindex])
+            else:
+                disp = self.bins[bindex].push(item)
             if disp is None:
                 rem = 0
                 self.set_size(self.size + 1)
             else:
+                if self.track_age:
+                    disp, _ = disp
                 rem = disp[0]
-
-            self.avgs[biin] = (self.avgs[biin]*(len(self.bins[biin]) - 1) + scalar - rem)/len(self.bins[biin])
+            self.avgs[bindex] = (self.avgs[bindex]*(len(self.bins[bindex]) - 1) + scalar - rem)/len(self.bins[bindex])
+            self.tick_buffer_ages(new_push_idx=bindex)
 
     def set_weights(self, values_to_weights):
         """
@@ -332,8 +414,8 @@ class BinnedReplayBufferDiskStorage(LangReplayBuffer):
         # weight empty bins at 0
         weights = weights*(self.bin_lens > 0)
 
-        biin = torch.multinomial(weights, 1)
-        return self.bins[biin].sample_one()
+        bindex = torch.multinomial(weights, 1)
+        return self.get_output_item(item=self.bins[bindex].sample_one(), bindex=bindex)
 
     def sample(self, batch, **kwargs):
         """
@@ -380,11 +462,14 @@ class BinnedReplayBufferDiskStorage(LangReplayBuffer):
         return self.size
 
     def __getitem__(self, item):
+        """
+        weird but they call the index 'item'
+        """
         if item >= self.size:
             raise IndexError
         for biin in self.bins:
             if item < biin.size:
-                return biin[item]
+                return self.get_output_item(item=biin[item], bindex=item)
             item -= biin.size
 
     @property
@@ -393,9 +478,108 @@ class BinnedReplayBufferDiskStorage(LangReplayBuffer):
                             dtype=torch.float,
                             )
 
+    def tick_buffer_ages(self, new_push_idx):
+        if self.track_age:
+            for c in range(len(self.bins)):
+                # all others are added to
+                self.info['buffer ages'][c] += 1
+            # this one is updated to zero
+            self.info['buffer ages'][new_push_idx] = 0
+
+    def get_output_item(self, item, bindex):
+        """
+        gets true age of item by adding the buffer age to the age of item in buffer
+        """
+        if self.track_age:
+            item, age = item
+            return (item, age + self.info['buffer ages'][bindex])
+        else:
+            return item
+
 
 if __name__ == '__main__':
+
     DIR = os.path.dirname(os.path.dirname(os.path.join(os.getcwd(), sys.argv[0])))
-    test = ReplayBufferDiskStorage(capacity=3, storage_dir=os.path.join(DIR, 'data', 'buffers', 'replay_buffer_test'))
-    test.extend('help')
-    print(list(test.sample(3)))
+    storage_dir = os.path.join(DIR, 'temp')
+    # normal test
+    test = ReplayBufferDiskStorage(capacity=3,
+                                   storage_dir=storage_dir,
+                                   track_age=False,
+                                   count_capacity=4
+                                   )
+    sring = '0123456789abcdefghi'
+    test.extend(sring)
+    stuff = list(test.sample(3))
+    print(stuff)
+    possible = []
+    for age, item in enumerate(sring[::-1]):
+        possible.append(item)
+        if age == test.capacity:
+            break
+    for t in stuff:
+        assert t in possible
+    test.clear()
+
+    # age test
+    test = ReplayBufferDiskStorage(capacity=3,
+                                   storage_dir=storage_dir,
+                                   track_age=True,
+                                   count_capacity=4
+                                   )
+    sring = '0123456789abcdefghi'
+    test.extend(sring)
+    stuff = list(test.sample(3))
+    print(stuff)
+    possible = []
+    for age, item in enumerate(sring[::-1]):
+        print((item, age), end=', ')
+        possible.append((item, age))
+        if age == test.capacity:
+            print()
+            break
+    for t in stuff:
+        assert t in possible
+    test.clear()
+
+    # normal binned test
+    test = BinnedReplayBufferDiskStorage(capacity=30,
+                                         storage_dir=storage_dir,
+                                         track_age=False,
+                                         count_capacity=1000,
+                                         bounds=[-1, .25, .5, .75, 1]
+                                         )
+    sring = ['0123456789abcdefghij'[torch.randint(0, 10, ())] for _ in range(10000)]
+    all_items = []
+    for item in sring:
+        item = (torch.rand(1).item(), item)
+        test.push(item)
+        all_items.append(item)
+    stuff = list(test.sample(3))
+    possible = []
+    for age, item in enumerate(all_items[::-1]):
+        possible.append(item)
+    for t in stuff:
+        assert t in possible
+    test.clear()
+
+    # binned age test
+
+    test = BinnedReplayBufferDiskStorage(capacity=30,
+                                         storage_dir=storage_dir,
+                                         track_age=True,
+                                         count_capacity=1000,
+                                         bounds=[-1, .25, .5, .75, 1]
+                                         )
+    sring = ['0123456789abcdefghij'[torch.randint(0, 10, ())] for _ in range(10000)]
+    all_items = []
+    for item in sring:
+        item = (torch.rand(1).item(), item)
+        test.push(item)
+        all_items.append(item)
+    stuff = list(test.sample(3))
+    possible = []
+    for age, item in enumerate(all_items[::-1]):
+        possible.append((item, age))
+    for t in stuff:
+        assert t in possible
+    test.clear()
