@@ -233,8 +233,8 @@ class TeamTrainer:
                                    replacement=True,
                                    ).flatten()
         initial_teams[indices] = result
-        formation_probability = torch.prod(dist[result]).detach()
-        og_formation_probability = torch.prod(og_dist[result]).detach()
+        formation_probability = torch.prod(dist[indices[0], indices[1], result]).detach()
+        og_formation_probability = torch.prod(og_dist[indices[0], indices[1], result]).detach()
         return initial_teams, formation_probability, og_formation_probability
 
     def create_masked_teams(self, T, N=1):
@@ -767,8 +767,8 @@ class MLMTeamTrainer(TeamTrainer):
                                    replacement=True,
                                    ).flatten()
         initial_teams[indices] = result
-        formation_probability = torch.prod(dist[result]).detach()
-        og_formation_probability = torch.prod(og_dist[result]).detach()
+        formation_probability = torch.prod(dist[range(len(dist)), result]).detach()
+        og_formation_probability = torch.prod(og_dist[range(len(og_dist)), result]).detach()
         return initial_teams, formation_probability, og_formation_probability
 
 
