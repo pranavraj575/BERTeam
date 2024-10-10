@@ -5,6 +5,7 @@ from BERTeam.outcome import PlayerInfo
 
 class LangReplayBuffer:
     storage_dir = None
+    track_age = False
 
     def reset_storage_dir(self, storage_dir):
         self.storage_dir = storage_dir

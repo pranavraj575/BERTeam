@@ -300,6 +300,7 @@ class MLMTeamTrainer(TeamTrainer):
                  team_builder: TeamBuilder,
                  buffer: LangReplayBuffer,
                  storage_dir=None,
+                 weight_decay_half_life=None,
                  ):
         """
         Args:
@@ -307,6 +308,10 @@ class MLMTeamTrainer(TeamTrainer):
             buffer:
             storage_dir: place to store files
                 if None, sets later
+            weight_decay_half_life: we would like to exponentially decay weights as time goes on
+                if we track age (self.buffer.track_age), we can do this
+                 weight_decay_half_life is the half life of the weights
+                 None if no decay
         """
         super().__init__(
             num_agents=team_builder.berteam.num_agents,
@@ -314,6 +319,7 @@ class MLMTeamTrainer(TeamTrainer):
         )
         self.team_builder = team_builder
         self.buffer = buffer
+        self.weight_decay_half_life = weight_decay_half_life
 
         if storage_dir is not None:
             self.reset_storage_dir(storage_dir=storage_dir)
@@ -405,7 +411,13 @@ class MLMTeamTrainer(TeamTrainer):
         self.optim.zero_grad()
         losses = torch.zeros(1)
         count = 0
-        for (scalar, obs_preembed, team, obs_mask, weight) in data:
+        for item in data:
+            if self.buffer.track_age:
+                (scalar, obs_preembed, team, obs_mask, weight), age = item
+                if self.weight_decay_half_life is not None:
+                    weight = weight*torch.pow(torch.tensor(1/2), age/self.weight_decay_half_life)
+            else:
+                (scalar, obs_preembed, team, obs_mask, weight) = item
             team = team.view((1, -1))
             if torch.is_tensor(obs_preembed) and torch.all(torch.isnan(obs_preembed)):
                 obs_preembed = None
@@ -787,6 +799,7 @@ class DiscreteInputTrainer(MLMTeamTrainer):
                  append_pos_encode_input=False,
                  pos_encode_teams=True,
                  append_pos_encode_teams=False,
+                 weight_decay_half_life=100,
                  ):
         if pos_encode_teams:
             if append_pos_encode_teams:
@@ -823,7 +836,8 @@ class DiscreteInputTrainer(MLMTeamTrainer):
             team_builder=TeamBuilder(
                 berteam=berteam,
                 input_embedder=input_embedder,
-            )
+            ),
+            weight_decay_half_life=weight_decay_half_life,
         )
 
 
