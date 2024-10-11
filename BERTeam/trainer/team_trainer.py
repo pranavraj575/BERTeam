@@ -259,18 +259,12 @@ class TeamTrainer:
         Returns:
             distribution -> distribution map, which are sized (N,K) for an N batch of a K-multinomial
         """
-        if isinstance(t, (int, float)):
-            return (lambda dist: (1 - t)*dist + (t)*1./dist.shape[1])
-        else:
-            return (lambda dist:
-                    ((1 - t)*dist + (t)*torch.ones_like(dist)/dist.shape[1])/
-                    (torch.sum((1 - t)*dist) + torch.sum(t)*1/dist.shape[1])
-                    )
-            # equivalent to
-            # return (lambda dist:
-            #        ((1 - t)*dist + (t)*torch.ones_like(dist)/dist.shape[1])/
-            #        torch.sum((1 - t)*dist + (t)*torch.ones_like(dist)/dist.shape[1])
-            #        )
+
+        def noise(dist):
+            dist = (1 - t)*dist + (t)*torch.ones_like(dist)/dist.shape[-1]
+            return dist/torch.sum(dist, dim=-1, keepdim=True)
+
+        return noise
 
     def create_teams(self,
                      T,
@@ -301,6 +295,7 @@ class MLMTeamTrainer(TeamTrainer):
                  buffer: LangReplayBuffer,
                  storage_dir=None,
                  weight_decay_half_life=None,
+                 optimizer_kwargs=None,
                  ):
         """
         Args:
@@ -324,7 +319,9 @@ class MLMTeamTrainer(TeamTrainer):
         if storage_dir is not None:
             self.reset_storage_dir(storage_dir=storage_dir)
 
-        self.optim = torch.optim.Adam(team_builder.parameters())
+        if optimizer_kwargs is None:
+            optimizer_kwargs = dict()
+        self.optim = torch.optim.Adam(team_builder.parameters(), **optimizer_kwargs)
 
     def reset_storage_dir(self, storage_dir):
         self.buffer.reset_storage_dir(storage_dir=os.path.join(storage_dir, 'buffer'))
@@ -800,6 +797,7 @@ class DiscreteInputTrainer(MLMTeamTrainer):
                  pos_encode_teams=True,
                  append_pos_encode_teams=False,
                  weight_decay_half_life=100,
+                 optimizer_kwargs=None,
                  ):
         if pos_encode_teams:
             if append_pos_encode_teams:
@@ -838,6 +836,7 @@ class DiscreteInputTrainer(MLMTeamTrainer):
                 input_embedder=input_embedder,
             ),
             weight_decay_half_life=weight_decay_half_life,
+            optimizer_kwargs=optimizer_kwargs,
         )
 
 
