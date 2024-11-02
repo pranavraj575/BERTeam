@@ -16,7 +16,24 @@ class BERTeam(nn.Module):
                  dim_feedforward=None,
                  dropout=.1,
                  PosEncConstructor=PositionalAppender,
+                 num_output_layers=1,
+                 trans_kwargs=None,
+                 pos_enc_kwargs=None,
                  ):
+        """
+        Args:
+            num_agents: number of possible agents to choose from
+            embedding_dim: transformer embedding dim
+            nhead: numbwr of attention heads
+            num_encoder_layers: number of encoder layers
+            num_decoder_layers: number of decoder layers
+            dim_feedforward: dimension feedforward
+            dropout: dropout
+            PosEncConstructor: what positional encoder to use
+            num_output_layers:
+            trans_kwargs: dict with any other transformer kwargs
+            pos_enc_kwargs: dict with any positional encoding kwargs
+        """
         super().__init__()
         self.embedding_dim = embedding_dim
         if dim_feedforward is None:
@@ -30,18 +47,25 @@ class BERTeam(nn.Module):
         self.agent_embedding = Embedding(num_embeddings=self.num_tokens,
                                          embedding_dim=embedding_dim,
                                          )
-        self.pos_encoder = PosEncConstructor(d_model=embedding_dim,
-                                             dropout=dropout,
-                                             )
-        self.transform = Transformer(d_model=embedding_dim,
-                                     nhead=nhead,
-                                     num_encoder_layers=num_encoder_layers,
-                                     num_decoder_layers=num_decoder_layers,
-                                     dim_feedforward=dim_feedforward,
-                                     batch_first=True,  # takes in (N,S,E) input where N is batch and S is seq length
-                                     dropout=dropout,
-                                     )
-        self.output_layer = nn.Linear(embedding_dim, num_agents)
+        peekwargs = {'d_model': embedding_dim,
+                     'dropout': dropout,
+                     }
+        if pos_enc_kwargs is not None:
+            peekwargs.update(pos_enc_kwargs)
+        self.pos_encoder = PosEncConstructor(**peekwargs)
+        tkwargs = {
+            'd_model': embedding_dim,
+            'nhead': nhead,
+            'num_encoder_layers': num_encoder_layers,
+            'num_decoder_layers': num_decoder_layers,
+            'dim_feedforward': dim_feedforward,
+            'batch_first': True,  # takes in (N,S,E) input where N is batch and S is seq length
+            'dropout': dropout,
+        }
+        if trans_kwargs is not None:
+            tkwargs.update(trans_kwargs)
+        self.transform = Transformer(**tkwargs)
+        self.output_layers = [nn.Linear(embedding_dim, num_agents) for _ in range(num_output_layers)]
         self.softmax = nn.Softmax(dim=-1)
 
     def add_cls_tokens(self, target_team):
@@ -55,7 +79,14 @@ class BERTeam(nn.Module):
         (N, T) = target_team.shape
         return torch.cat((target_team, torch.ones((N, 1), dtype=target_team.dtype)*self.CLS), dim=1)
 
-    def forward(self, input_embedding, target_team, input_mask, output_probs=True, pre_softmax=False):
+    def forward(self,
+                input_embedding,
+                target_team,
+                input_mask,
+                output_probs=True,
+                pre_softmax=False,
+                output_layer_idx=0,
+                ):
         """
         Args:
             input_embedding: (N, S, E) shape tensor of input, or None if no input
@@ -66,6 +97,7 @@ class BERTeam(nn.Module):
             output_probs: whether to output the probability of each team member
                 otherwise just outputs the final embedding
             pre_softmax: if True, does not apply softmax to logits
+            output_layer_idx: if there are multiple output layers, specify which one to use
         Returns:
             if output_probs, (N, T, num_agents) probability distribution for each position
             otherwise, (N, T, embedding_dim) output of transformer model
@@ -95,9 +127,10 @@ class BERTeam(nn.Module):
                                         memory_key_padding_mask=input_mask,
                                         )
         if output_probs:
-            output = self.output_layer(output)
+            output_layer = self.output_layers[output_layer_idx]
+            output = output_layer.forward(output)
             if not pre_softmax:
-                output = self.softmax(output)
+                output = self.softmax.forward(output)
 
         return output
 
@@ -118,7 +151,14 @@ class TeamBuilder(nn.Module):
         self.input_embedder = input_embedder
         self.berteam = berteam
 
-    def forward(self, obs_preembed, target_team, obs_mask, output_probs=True, pre_softmax=False):
+    def forward(self,
+                obs_preembed,
+                target_team,
+                obs_mask,
+                output_probs=True,
+                pre_softmax=False,
+                output_layer_idx=0,
+                ):
         """
         Args:
             obs_preembed: (N, S, *) shape tensor of input, or None if no input
@@ -128,6 +168,8 @@ class TeamBuilder(nn.Module):
             output_probs: whether to output the probability of each team member
                 otherwise just outputs the final embedding
             pre_softmax: if True, does not apply softmax to logits
+            output_layer_idx: if specified, use this output layer
+                else use the default (0)
         Returns:
             if output_probs, (N, T, num_agents) probability distribution for each position
             otherwise, (N, T, embedding_dim) output of transformer model
@@ -142,6 +184,7 @@ class TeamBuilder(nn.Module):
                                     input_mask=embed_mask,
                                     output_probs=output_probs,
                                     pre_softmax=pre_softmax,
+                                    output_layer_idx=output_layer_idx,
                                     )
 
 

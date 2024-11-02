@@ -358,7 +358,24 @@ class MLMTeamTrainer(TeamTrainer):
               mask_probs=None,
               replacement_probs=(.8, .1, .1),
               mask_obs_prob=.1,
+              output_layer_idx=0,
+              use_L1_loss=False,
               ):
+        """
+        Args:
+            batch_size: batch size
+            minibatch: minibatch size (defaults to batch_size)
+            mask_probs: list of proabilities of masking to sample from
+                if None, samples (1/team_size, 2/team_size, ..., 1)
+                    for each obtained team size
+            replacement_probs: proportion of ([MASK], random element, same element) to replace masked elements with
+                default (.8, .1, .1) because BERT
+            mask_obs_prob: if >0, randomly masks observations with this probability as well
+            output_layer_idx: if specified, use this output layer of BERTeam
+            use_L1_loss: whether to use the L1 loss (self.training_step_L1)
+        Returns:
+            avg loss
+        """
         if minibatch is None:
             minibatch = batch_size
         if not len(self.buffer):
@@ -368,12 +385,19 @@ class MLMTeamTrainer(TeamTrainer):
         for i in range(0, batch_size, minibatch):
             tinybatch = min(i + minibatch, batch_size) - i
             # cut off the last batch if we go over
-            step_loss = self.training_step(
-                batch_size=tinybatch,
-                mask_probs=mask_probs,
-                replacement_probs=replacement_probs,
-                mask_obs_prob=mask_obs_prob,
-            )
+            if use_L1_loss:
+                step_loss = self.training_step_L1(
+                    batch_size=tinybatch,
+                    output_layer_idx=output_layer_idx,
+                )
+            else:
+                step_loss = self.training_step_BERT(
+                    batch_size=tinybatch,
+                    mask_probs=mask_probs,
+                    replacement_probs=replacement_probs,
+                    mask_obs_prob=mask_obs_prob,
+                    output_layer_idx=output_layer_idx,
+                )
             loss += tinybatch*step_loss
         # clear any remaining gradient from memory
         self.optim.zero_grad()
@@ -383,12 +407,79 @@ class MLMTeamTrainer(TeamTrainer):
         #    torch.cuda.empty_cache()
         return loss/batch_size
 
-    def training_step(self,
-                      batch_size,
-                      mask_probs=None,
-                      replacement_probs=(.8, .1, .1),
-                      mask_obs_prob=.1,
-                      ):
+    def _data_sample_iterator(self, batch_size):
+        data = self.buffer.sample(batch=batch_size)
+        for item in data:
+            if self.buffer.track_age:
+                (scalar, obs_preembed, team, obs_mask, weight), age = item
+                if self.weight_decay_half_life is not None:
+                    weight = weight*torch.pow(torch.tensor(1/2), age/self.weight_decay_half_life)
+            else:
+                (scalar, obs_preembed, team, obs_mask, weight) = item
+            yield (scalar, obs_preembed, team, obs_mask, weight)
+
+    def training_step_L1(self,
+                         batch_size,
+                         output_layer_idx=0,
+                         ):
+        """
+        apply the following loss
+            output of BERTeam is a distribuiton over all possible teams D (point on simplex over all possible teams)
+            for a sampled team T, we want to take the L1 loss |D-e_T|_1
+                e_T is the basis vector with a 1 on the dimension of team T
+            since D is a point on the simplex, we can simplify to
+                (1-D_T)+sum_{T'!=T}(D_T')=2-2D_T
+            thus, we only need to calculate D_T to get this loss
+            we obtain D_T by multiplying the probabilities of choosing each each member one at a time
+            we also consider a random permutation to balance out order effects
+        Args:
+            batch_size: batch size
+            output_layer_idx: if specified, use this output layer of BERTeam
+        Returns:
+            avg L1 loss
+        """
+        if not len(self.buffer):
+            print('WARNING: trying to train on empty buffer')
+            return None
+        self.optim.zero_grad()
+        loss_sum = torch.tensor([0.])
+        for (scalar,
+             obs_preembed,
+             team,
+             obs_mask,
+             weight,
+             ) in self._data_sample_iterator(batch_size=batch_size):
+            team = team.view(1, -1)
+            T = team.size(1)
+            perm = torch.randperm(T)
+            prob = torch.tensor([1.])
+            temp = self.create_masked_teams(T=T, N=1)
+            for i in perm:
+                out = self.team_builder.forward(
+                    obs_preembed=obs_preembed,
+                    target_team=temp.clone(),  # clone to avoid gradient errors
+                    obs_mask=obs_mask,
+                    output_probs=True,
+                    pre_softmax=False,
+                    output_layer_idx=output_layer_idx,
+                )
+                # probability of choosing the correct token
+                prob *= out[0, i, team[0, i]]
+                # unmask the true token
+                team[0, i] = team[i]
+            loss_sum += 2 - 2*prob
+        loss = loss_sum/batch_size
+        loss.backward()
+        self.optim.step()
+        return loss.item()
+
+    def training_step_BERT(self,
+                           batch_size,
+                           mask_probs=None,
+                           replacement_probs=(.8, .1, .1),
+                           mask_obs_prob=.1,
+                           output_layer_idx=0,
+                           ):
         """
         Args:
             batch_size: size of batch to train on
@@ -398,23 +489,22 @@ class MLMTeamTrainer(TeamTrainer):
             replacement_probs: proportion of ([MASK], random element, same element) to replace masked elements with
                 default (.8, .1, .1) because BERT
             mask_obs_prob: if >0, randomly masks observations with this probability as well
+            output_layer_idx: if specified, use this output layer of BERTeam
         Returns:
             avg losses for whole dataset
         """
         if not len(self.buffer):
             print('WARNING: trying to train on empty buffer')
             return None
-        data = self.buffer.sample(batch=batch_size)
         self.optim.zero_grad()
         losses = torch.zeros(1)
         count = 0
-        for item in data:
-            if self.buffer.track_age:
-                (scalar, obs_preembed, team, obs_mask, weight), age = item
-                if self.weight_decay_half_life is not None:
-                    weight = weight*torch.pow(torch.tensor(1/2), age/self.weight_decay_half_life)
-            else:
-                (scalar, obs_preembed, team, obs_mask, weight) = item
+        for (scalar,
+             obs_preembed,
+             team,
+             obs_mask,
+             weight) in self._data_sample_iterator(batch_size=batch_size):
+
             team = team.view((1, -1))
             if torch.is_tensor(obs_preembed) and torch.all(torch.isnan(obs_preembed)):
                 obs_preembed = None
@@ -432,6 +522,7 @@ class MLMTeamTrainer(TeamTrainer):
                                         mask_prob=mask_prob,
                                         replacement_probs=replacement_probs,
                                         mask_obs_prob=mask_obs_prob,
+                                        output_layer_idx=output_layer_idx,
                                         )
             # keep gradients
             losses += loss*weight
@@ -448,6 +539,7 @@ class MLMTeamTrainer(TeamTrainer):
                         mask_prob,
                         replacement_probs=(.8, .1, .1),
                         mask_obs_prob=.1,
+                        output_layer_idx=0,
                         ):
         """
         runs learn step on a lot of mask_probabilities
@@ -477,6 +569,7 @@ class MLMTeamTrainer(TeamTrainer):
                                 obs_mask=temp_obs_mask,
                                 mask_prob=mask_prob,
                                 replacement_probs=replacement_probs,
+                                output_layer_idx=output_layer_idx,
                                 )
         return loss
 
@@ -486,6 +579,7 @@ class MLMTeamTrainer(TeamTrainer):
                     obs_mask,
                     mask_prob=.5,
                     replacement_probs=(.8, .1, .1),
+                    output_layer_idx=0,
                     ):
         """
         randomly masks winning team members, runs the transformer token prediction model, and gets crossentropy loss
@@ -510,6 +604,7 @@ class MLMTeamTrainer(TeamTrainer):
                                            obs_mask=obs_mask,
                                            output_probs=True,
                                            pre_softmax=True,
+                                           output_layer_idx=output_layer_idx,
                                            )
         criterion = nn.CrossEntropyLoss()
 
@@ -897,7 +992,7 @@ if __name__ == '__main__':
                             shuffle=True,
                             batch_size=64,
                             )
-        loss = test.training_step(
+        loss = test.training_step_BERT(
             data=loader,
             sgd=True
         )
