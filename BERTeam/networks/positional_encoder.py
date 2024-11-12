@@ -62,7 +62,7 @@ class ClassicPositionalEncoding(AbstractPositionalEncoding):
         if base_period is None:
             # this is arranged so that the period of the 2i and 2i+1 entries are 2pi*10000^(i/additional_dim)
             # for some reason the period is not an even number in the original positional encoder, so we can do that if we must
-            base_period = math.pow(10000.0, 2/self.additional_dim)
+            base_period = math.pow(10000.0, 2/d_model)
             initial_period = (2*torch.pi)
         else:
             # the initial period being 1 is kind of useless, so start off at 1/base_period^1

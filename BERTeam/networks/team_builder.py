@@ -67,6 +67,11 @@ class BERTeam(nn.Module):
         self.transform = Transformer(**tkwargs)
         self.output_layers = [nn.Linear(embedding_dim, num_agents) for _ in range(num_output_layers)]
         self.softmax = nn.Softmax(dim=-1)
+        self.primary_output_layer = 0
+
+    def set_primary_output_layer(self, output_layer_idx):
+        assert type(output_layer_idx) == int and output_layer_idx >= 0 and output_layer_idx < len(self.output_layers)
+        self.primary_output_layer = output_layer_idx
 
     def add_cls_tokens(self, target_team):
         """
@@ -85,7 +90,7 @@ class BERTeam(nn.Module):
                 input_mask,
                 output_probs=True,
                 pre_softmax=False,
-                output_layer_idx=0,
+                output_layer_idx=None,
                 ):
         """
         Args:
@@ -102,6 +107,8 @@ class BERTeam(nn.Module):
             if output_probs, (N, T, num_agents) probability distribution for each position
             otherwise, (N, T, embedding_dim) output of transformer model
         """
+        if output_layer_idx is None:
+            output_layer_idx = self.primary_output_layer
         N, T = target_team.shape
 
         # creates a sequence of size S+1
@@ -157,7 +164,7 @@ class TeamBuilder(nn.Module):
                 obs_mask,
                 output_probs=True,
                 pre_softmax=False,
-                output_layer_idx=0,
+                output_layer_idx=None,
                 ):
         """
         Args:

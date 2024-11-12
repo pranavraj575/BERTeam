@@ -33,13 +33,12 @@ class TeamTrainer:
         """
         adds element to language replay buffer
         Args:
-            scalar:
-            obs_preembed:
-            team:
-            obs_mask:
-
+            scalar: identifier of whether a team won, tied, lost
+            obs_preembed: (1,S,*) any shape, batch size 1
+            team: (K,) shape long tensor
+            obs_mask: (1,S), which elements of obs to mask, if necessary
+            weight: weight to assign to sample
         Returns:
-
         """
         pass
 
@@ -349,6 +348,16 @@ class MLMTeamTrainer(TeamTrainer):
         self.optim.load_state_dict(dic['optim'])
 
     def add_to_buffer(self, scalar, obs_preembed, team, obs_mask, weight=1.):
+        """
+        adds element to language replay buffer
+        Args:
+            scalar: identifier of whether a team won, tied, lost
+            obs_preembed: (1,S,*) any shape, batch size 1
+            team: (K,) shape long tensor
+            obs_mask: (1,S), which elements of obs to mask, if necessary
+            weight: weight to assign to sample
+        Returns:
+        """
         item = (scalar, obs_preembed, team, obs_mask, weight)
         self.buffer.push(item=item)
 
@@ -358,7 +367,7 @@ class MLMTeamTrainer(TeamTrainer):
               mask_probs=None,
               replacement_probs=(.8, .1, .1),
               mask_obs_prob=.1,
-              output_layer_idx=0,
+              output_layer_idx=None,
               use_L1_loss=False,
               ):
         """
@@ -378,6 +387,9 @@ class MLMTeamTrainer(TeamTrainer):
         """
         if minibatch is None:
             minibatch = batch_size
+        data_iterator = self._data_sample_iterator(batch_size=batch_size)
+        if batch_size is None:
+            batch_size = len(self.buffer)
         if not len(self.buffer):
             print('WARNING: trying to train on empty buffer')
             return None
@@ -389,6 +401,7 @@ class MLMTeamTrainer(TeamTrainer):
                 step_loss = self.training_step_L1(
                     batch_size=tinybatch,
                     output_layer_idx=output_layer_idx,
+                    data_iterator=data_iterator,
                 )
             else:
                 step_loss = self.training_step_BERT(
@@ -397,6 +410,7 @@ class MLMTeamTrainer(TeamTrainer):
                     replacement_probs=replacement_probs,
                     mask_obs_prob=mask_obs_prob,
                     output_layer_idx=output_layer_idx,
+                    data_iterator=data_iterator,
                 )
             loss += tinybatch*step_loss
         # clear any remaining gradient from memory
@@ -420,7 +434,9 @@ class MLMTeamTrainer(TeamTrainer):
 
     def training_step_L1(self,
                          batch_size,
-                         output_layer_idx=0,
+                         output_layer_idx=None,
+                         entropy_reg=0.,
+                         data_iterator=None,
                          ):
         """
         apply the following loss
@@ -432,9 +448,15 @@ class MLMTeamTrainer(TeamTrainer):
             thus, we only need to calculate D_T to get this loss
             we obtain D_T by multiplying the probabilities of choosing each each member one at a time
             we also consider a random permutation to balance out order effects
+            we also can clip loss by removing gradients (with max) for increasing a probability past a value
         Args:
             batch_size: batch size
             output_layer_idx: if specified, use this output layer of BERTeam
+            entropy_reg: regularizes distribution by encouraging entropy of each conditional distribution
+                adds entropy to overall loss, scaled by entropy_reg
+                we scale to ensure that from the L1 optimizer p*, at most entropy_reg can be moved to make a new optimizer
+                i.e. the new optimizer should be (entropy_reg)-far from a L1 optimizer
+            data_iterator: iterator over samples, if None, samples from buffer
         Returns:
             avg L1 loss
         """
@@ -443,18 +465,28 @@ class MLMTeamTrainer(TeamTrainer):
             return None
         self.optim.zero_grad()
         loss_sum = torch.tensor([0.])
+        entropy_reg_sum = torch.tensor([0.])
+        count = 0
+        if data_iterator is None:
+            data_iterator = self._data_sample_iterator(batch_size=batch_size)
+
         for (scalar,
              obs_preembed,
              team,
              obs_mask,
              weight,
-             ) in self._data_sample_iterator(batch_size=batch_size):
+             ) in data_iterator:
             team = team.view(1, -1)
             T = team.size(1)
             perm = torch.randperm(T)
             prob = torch.tensor([1.])
+
+            # will accumulate the sum of the entropies of each conditional distribution
+            total_entropy = torch.tensor([0.])
+
             temp = self.create_masked_teams(T=T, N=1)
             for i in perm:
+                # out is (1, T, num_agents)
                 out = self.team_builder.forward(
                     obs_preembed=obs_preembed,
                     target_team=temp.clone(),  # clone to avoid gradient errors
@@ -463,12 +495,33 @@ class MLMTeamTrainer(TeamTrainer):
                     pre_softmax=False,
                     output_layer_idx=output_layer_idx,
                 )
-                # probability of choosing the correct token
-                prob *= out[0, i, team[0, i]]
+                dist = out[0, i]  # (num_agents,) dist for relevant position
+                if entropy_reg > 0:  # dont need to calculate this if reg is 0
+                    total_entropy += -torch.sum(dist*torch.log(dist))
+
+                # clipped probability of choosing the correct token, if we have largerthan an element_clip probability,
+                #  gradients dont flow
+                prob *= dist[team[0, i]]
                 # unmask the true token
-                team[0, i] = team[i]
-            loss_sum += 2 - 2*prob
-        loss = loss_sum/batch_size
+                temp[0, i] = team[0, i]
+            l1loss = (2 - 2*prob)
+            loss_sum += weight*l1loss
+
+            # max total entropy is obtained when each distribution is uniform, with prob 1/num_agents
+            # at this point, entropy is -sum_{num_agents}((1/num_agents) * log(1/num_agents))=-log(1/num_agents)
+            # summed over each of T distirbutions
+            max_total_entropy = -T*torch.log(torch.tensor([1/self.num_agents]))
+            # min_entropy is 0, obtained by having a deterministic distribution, since log(1)=0
+            # thus, maximum deviation due to entropy is max_entropy
+
+            # gives a 'bonus' for high entropy solutions
+            # maximal bonus is 2*entropy_reg, which is overshadowed by shifting prob by entropy_reg
+            # thus, this incentivizes a shift of at most entropy_reg from the L1 optimizer
+            entropy_reg_loss = -2*entropy_reg*total_entropy/max_total_entropy
+            entropy_reg_sum += abs(weight)*entropy_reg_loss
+            count += 1
+
+        loss = (loss_sum + entropy_reg_sum)/count
         loss.backward()
         self.optim.step()
         return loss.item()
@@ -478,7 +531,8 @@ class MLMTeamTrainer(TeamTrainer):
                            mask_probs=None,
                            replacement_probs=(.8, .1, .1),
                            mask_obs_prob=.1,
-                           output_layer_idx=0,
+                           output_layer_idx=None,
+                           data_iterator=None,
                            ):
         """
         Args:
@@ -490,6 +544,7 @@ class MLMTeamTrainer(TeamTrainer):
                 default (.8, .1, .1) because BERT
             mask_obs_prob: if >0, randomly masks observations with this probability as well
             output_layer_idx: if specified, use this output layer of BERTeam
+            data_iterator: iterator over samples, if None, samples from buffer
         Returns:
             avg losses for whole dataset
         """
@@ -499,11 +554,14 @@ class MLMTeamTrainer(TeamTrainer):
         self.optim.zero_grad()
         losses = torch.zeros(1)
         count = 0
+        if data_iterator is None:
+            data_iterator = self._data_sample_iterator(batch_size=batch_size)
+
         for (scalar,
              obs_preembed,
              team,
              obs_mask,
-             weight) in self._data_sample_iterator(batch_size=batch_size):
+             weight) in data_iterator:
 
             team = team.view((1, -1))
             if torch.is_tensor(obs_preembed) and torch.all(torch.isnan(obs_preembed)):
@@ -539,7 +597,7 @@ class MLMTeamTrainer(TeamTrainer):
                         mask_prob,
                         replacement_probs=(.8, .1, .1),
                         mask_obs_prob=.1,
-                        output_layer_idx=0,
+                        output_layer_idx=None,
                         ):
         """
         runs learn step on a lot of mask_probabilities
@@ -579,7 +637,7 @@ class MLMTeamTrainer(TeamTrainer):
                     obs_mask,
                     mask_prob=.5,
                     replacement_probs=(.8, .1, .1),
-                    output_layer_idx=0,
+                    output_layer_idx=None,
                     ):
         """
         randomly masks winning team members, runs the transformer token prediction model, and gets crossentropy loss
@@ -659,6 +717,7 @@ class MLMTeamTrainer(TeamTrainer):
                            obs_mask=None,
                            team_noise_model=None,
                            valid_locations=None,
+                           output_layer_idx=None,
                            ):
         """
         adds the specified member to the team in a random position (sampled from the network distribution)
@@ -675,6 +734,7 @@ class MLMTeamTrainer(TeamTrainer):
                 ((N,T) -> (N,T))
                 default None
             valid_locations: boolean array of size (N,T) that determines whether each location is valid
+            output_layer_idx: idx of BERTeam output layer, if not default
         Returns:
             team with member attached
         """
@@ -687,6 +747,7 @@ class MLMTeamTrainer(TeamTrainer):
                                          obs_mask=obs_mask,
                                          output_probs=True,
                                          pre_softmax=False,
+                                         output_layer_idx=output_layer_idx,
                                          )
         # (N, T)
         conditional_dist = dist[:, :, member]
@@ -741,13 +802,30 @@ class MLMTeamTrainer(TeamTrainer):
                                T,
                                N=1,
                                init_team=None,
-                               prob=torch.tensor(1.),
-                               tracked=None,
                                obs_preembed=None,
                                obs_mask=None,
                                noise_model=None,
                                valid_members=None,
+                               output_layer_idx=None,
+                               prob=torch.tensor(1.),
+                               tracked=None,
                                ):
+        """
+        gets total distribuiton of team of specified size (T,N)
+        Args:
+            T: team members
+            N: number of teams
+            init_team: initial (N,T) array, if we want to fix certian members
+            obs_preembed: observation to condition on
+            obs_mask: obs mask to condition on
+            noise_model: passed to get_member_distribution
+            valid_members: passed to get_member_distribution
+            output_layer_idx: idx of BERTeam output layer to use, if not default
+            prob: used for recursion
+            tracked: recursion
+        Returns:
+            dict(flattened team array -> probability) distribution sums to 1
+        """
         if init_team is None:
             init_team = self.create_masked_teams(T=T, N=N)
         if tracked is None:
@@ -759,6 +837,7 @@ class MLMTeamTrainer(TeamTrainer):
                                                               obs_mask=obs_mask,
                                                               noise_model=noise_model,
                                                               valid_members=valid_members,
+                                                              output_layer_idx=output_layer_idx,
                                                               )
         if indices is None:
             obj = tuple(init_team.detach().numpy().flatten())
@@ -784,6 +863,7 @@ class MLMTeamTrainer(TeamTrainer):
                                                 obs_mask=obs_mask,
                                                 noise_model=noise_model,
                                                 valid_members=valid_members,
+                                                output_layer_idx=output_layer_idx,
                                                 )
         return tracked
 
@@ -794,7 +874,18 @@ class MLMTeamTrainer(TeamTrainer):
                                 obs_mask=None,
                                 noise_model=None,
                                 valid_members=None,
+                                output_layer_idx=None,
                                 ):
+        """
+        returns probability distribution of next member being added to team
+        Args:
+            init_team: already initialized team
+            indices: indices to check, if None, checks all masked elements
+            output_layer_idx: idx of BERTeam output layer to use, if not default
+        Returns:
+            indices, distribution of agents for each index
+                (|indices|,num_agents) where each index is a distribution
+        """
         if indices is None:
             indices = torch.where(torch.eq(init_team, self.MASK))
         if len(indices[0]) == 0:
@@ -804,6 +895,7 @@ class MLMTeamTrainer(TeamTrainer):
                                            obs_mask=obs_mask,
                                            output_probs=True,
                                            pre_softmax=False,
+                                           output_layer_idx=output_layer_idx,
                                            )
 
         og_dist = output[indices]  # (|indices|, num_agents) multinomial distribution for each index to update
@@ -828,6 +920,7 @@ class MLMTeamTrainer(TeamTrainer):
                           obs_mask=None,
                           noise_model=None,
                           valid_members=None,
+                          output_layer_idx=None,
                           ):
         """
         updates initial teams by updating specified indices with samples from the probability distribution
@@ -841,6 +934,7 @@ class MLMTeamTrainer(TeamTrainer):
             obs_mask: size (N,S) boolean array of whether to mask each input embedding
             noise_model: noise to add to probability distribution, if None, doesnt add noise
             valid_members: (N,T,num_agents) boolean array of which agents are valid for which locations
+            output_layer_idx: idx of BERTeam output layer to use, if not default
         Returns:
             team with updates, formation probability, noiseless foramtion probability
         """
@@ -862,12 +956,13 @@ class MLMTeamTrainer(TeamTrainer):
                                                               obs_preembed=obs_preembed,
                                                               obs_mask=obs_mask,
                                                               noise_model=noise_model,
-                                                              valid_members=valid_members
+                                                              valid_members=valid_members,
+                                                              output_layer_idx=output_layer_idx,
                                                               )
-
+        # dist is (|indices|, num_agents)
         # torch.multinomial samples each
         result = torch.multinomial(dist,
-                                   len(indices[0]),
+                                   1,
                                    replacement=True,
                                    ).flatten()
         initial_teams[indices] = result
@@ -893,6 +988,9 @@ class DiscreteInputTrainer(MLMTeamTrainer):
                  append_pos_encode_teams=False,
                  weight_decay_half_life=100,
                  optimizer_kwargs=None,
+                 num_output_layers=1,
+                 trans_kwargs=None,
+                 pos_enc_kwargs=None,
                  ):
         if pos_encode_teams:
             if append_pos_encode_teams:
@@ -909,6 +1007,9 @@ class DiscreteInputTrainer(MLMTeamTrainer):
                           dim_feedforward=dim_feedforward,
                           dropout=dropout,
                           PosEncConstructor=PosEncConstructorTeams,
+                          num_output_layers=num_output_layers,
+                          trans_kwargs=trans_kwargs,
+                          pos_enc_kwargs=pos_enc_kwargs,
                           )
         if pos_encode_input:
             if append_pos_encode_input:
@@ -937,6 +1038,7 @@ class DiscreteInputTrainer(MLMTeamTrainer):
 
 if __name__ == '__main__':
     from matplotlib import pyplot as plt
+    from BERTeam.buffer.language_replay_buffer import ReplayBufferDiskStorage
 
     N = 32  # number of teams to train on per epoch
     eval_N = 9  # number of teams to evaluate on
@@ -944,23 +1046,29 @@ if __name__ == '__main__':
     T = 5  # size of team
     num_inputs = 4  # number of distinct input tokens
 
-    epochs = 300
+    epochs = 500
     torch.random.manual_seed(69)
 
     E = 64  # embedding dim
 
-    test = DiscreteInputTrainer(num_agents=69,
-                                num_input_tokens=num_inputs,
-                                embedding_dim=E,
-                                pos_encode_input=True,
-                                append_pos_encode_input=True,
-                                pos_encode_teams=True,
-                                append_pos_encode_teams=True,
-                                num_decoder_layers=3,
-                                num_encoder_layers=3,
-                                dropout=0.1,
-                                nhead=8,
-                                )
+    test = DiscreteInputTrainer(
+        num_agents=69,
+        num_input_tokens=num_inputs,
+        embedding_dim=E,
+        pos_encode_input=True,
+        append_pos_encode_input=True,
+        pos_encode_teams=True,
+        append_pos_encode_teams=True,
+        num_decoder_layers=3,
+        num_encoder_layers=3,
+        dropout=0.1,
+        nhead=8,
+        buffer=ReplayBufferDiskStorage(
+            storage_dir='test_replay_buffer',
+            capacity=100,
+            track_age=True,
+        )
+    )
 
     basic_team = torch.arange(T, dtype=torch.long)
 
@@ -986,19 +1094,19 @@ if __name__ == '__main__':
         # input_mask = torch.zeros((N, S), dtype=torch.bool)
         # out_teams = torch.stack([random_shuffle() for _ in range(N)], dim=0)
         out_teams = torch.stack([correct_output(t) for t in input_preembedding], dim=0)
-
-        data = list(zip(input_preembedding, out_teams, input_mask))
-        loader = DataLoader(data,
-                            shuffle=True,
-                            batch_size=64,
-                            )
-        loss = test.training_step_BERT(
-            data=loader,
-            sgd=True
-        )
+        for _ in range(N):
+            obs_preembed = torch.randint(0, num_inputs, (1, S))
+            test.add_to_buffer(
+                scalar=1,
+                obs_preembed=obs_preembed,
+                team=correct_output(obs_preembed),
+                obs_mask=None,
+                weight=1,
+            )
+        loss = test.training_step_BERT(batch_size=N)
 
         losses.append(loss)
-        print('epoch', epoch, '\tloss', loss.item())
+        print('epoch', epoch, '\tloss', loss)
     # print(test.mask_and_learn(input_embedding_gen=input_embeddings,
     #                          winning_team_gen=(init_team.clone() for _ in range(N))))
     init_teams = test.create_masked_teams(T=T, N=eval_N)
@@ -1009,12 +1117,12 @@ if __name__ == '__main__':
     for i in range(T):
         # force it to add member i to the team
         # init_teams = test.add_member_to_team(i, init_team=init_teams, obs_preembed=input_preembedding)
-
         test.mutate_add_member(initial_teams=init_teams, obs_preembed=input_preembedding)
         print(init_teams)
     print('goal:')
     goal = torch.stack([correct_output(t) for t in input_preembedding])
     print(goal)
+    test.clear()
 
     print('accuracy:',
           round((torch.sum(init_teams == goal)/torch.sum(torch.ones_like(init_teams))).item()*100, 2),
