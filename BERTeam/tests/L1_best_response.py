@@ -4,7 +4,6 @@ if __name__ == '__main__':
     from BERTeam.trainer.team_trainer import DiscreteInputTrainer
     from BERTeam.buffer.language_replay_buffer import ReplayBufferDiskStorage
 
-
     # results:
     #  seems like just L1 loss does not work when the optimizer is complex
     #   (it gets stuck maximizing another guy, does not learn good conditional distributions)
@@ -71,7 +70,10 @@ if __name__ == '__main__':
     best_responses = [t for t in keys if summed_data[t] == opt]
     for t, w in data:
         test.add_to_buffer(
-            scalar=1,
+            scalar=1,  # this is not usually the way to do it, however, this works for this example
+            # usually, we would put scalar=w, and use a binned replay buffer so that BERTeam is trained to predict good teams
+            # however, in our case we have very few points with all positive weights,
+            #   so we can get away with just weighting them according to their output
             obs_mask=None,
             team=torch.tensor(t),
             obs_preembed=None,

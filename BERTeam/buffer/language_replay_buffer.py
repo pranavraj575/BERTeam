@@ -304,7 +304,7 @@ class ReplayBufferDiskStorage(LangReplayBuffer):
             return item
 
 
-class GeneralBinnedReplayBufferDiskStorage(LangReplayBuffer):
+class GeneralBinnedReplayBuffer(LangReplayBuffer):
     """
     creates multiple disk replay buffers, each representing a 'bin' of data
     """
@@ -318,20 +318,22 @@ class GeneralBinnedReplayBufferDiskStorage(LangReplayBuffer):
                  independent_ages=True,
                  count_capacity=1e12,
                  ignore_zeros=True,
+                 BinBufferClass=ReplayBufferDiskStorage,
                  ):
         """
         Args:
             num_bins: number of bins
             independent_ages: each bin has an independent age
             ignore_zeros: just pretend zeros do not happen, no reason to have zero weighted elements in dataset
+            BinBufferClass: class to use for each bin
         """
         super().__init__()
-        self.bins = [ReplayBufferDiskStorage(storage_dir=None,
-                                             capacity=capacity,
-                                             device=device,
-                                             track_age=track_age,
-                                             count_capacity=count_capacity,
-                                             )
+        self.bins = [BinBufferClass(storage_dir=None,
+                                    capacity=capacity,
+                                    device=device,
+                                    track_age=track_age,
+                                    count_capacity=count_capacity,
+                                    )
                      for _ in range(num_bins)
                      ]
         self.info = {
@@ -344,6 +346,7 @@ class GeneralBinnedReplayBufferDiskStorage(LangReplayBuffer):
         self.track_age = track_age
         self.independent_ages = independent_ages
         self.ignore_zeros = ignore_zeros
+        self.num_bins = num_bins
 
     def reset_storage_dir(self, storage_dir):
         super().reset_storage_dir(storage_dir=storage_dir)
@@ -475,8 +478,9 @@ class GeneralBinnedReplayBufferDiskStorage(LangReplayBuffer):
             return item
 
 
-class BinnedReplayBufferDiskStorage(GeneralBinnedReplayBufferDiskStorage):
+class BinnedReplayBufferDiskStorage(GeneralBinnedReplayBuffer):
     """
+    TODO: the name is old, we should change it along with coevolver
     creates multiple disk replay buffers, each representing a 'bin' of data
     items must begin with a scalar that represents how much it should show up in the data
     """
@@ -490,6 +494,7 @@ class BinnedReplayBufferDiskStorage(GeneralBinnedReplayBufferDiskStorage):
                  independent_ages=True,
                  count_capacity=1e12,
                  ignore_zeros=True,
+                 BinBufferClass=ReplayBufferDiskStorage,
                  ):
         """
         Args:
@@ -515,6 +520,7 @@ class BinnedReplayBufferDiskStorage(GeneralBinnedReplayBufferDiskStorage):
                          independent_ages=independent_ages,
                          count_capacity=count_capacity,
                          ignore_zeros=ignore_zeros,
+                         BinBufferClass=BinBufferClass,
                          )
         # we should also track the bounds
         self.info['bounds'] = tuple(bounds)
@@ -590,7 +596,7 @@ class BinnedReplayBufferDiskStorage(GeneralBinnedReplayBufferDiskStorage):
             yield item
 
 
-class QuantileReplayBufferDiskStorage(GeneralBinnedReplayBufferDiskStorage):
+class QuantileReplayBuffer(GeneralBinnedReplayBuffer):
     """
     tracks bins that have certian quantile ranges, sampling must specify which quantile to sample
     items must begin with a scalar that represents how much it should show up in the data
@@ -605,9 +611,10 @@ class QuantileReplayBufferDiskStorage(GeneralBinnedReplayBufferDiskStorage):
                  independent_ages=True,
                  count_capacity=1e12,
                  SorterClass=SortedTree,
-                 sorter_capacity=None,
+                 sorter_capacity=float('inf'),
                  ignore_first=10,
                  ignore_zeros=True,
+                 BinBufferClass=ReplayBufferDiskStorage,
                  ):
         """
         Args:
@@ -622,8 +629,6 @@ class QuantileReplayBufferDiskStorage(GeneralBinnedReplayBufferDiskStorage):
         """
         if quantile_ranges is None:
             quantile_ranges = [((.5, 'o'), (1, 'c'))]
-        if sorter_capacity is None:
-            sorter_capacity = capacity
         self.sorter = SorterClass(capacity=sorter_capacity)
         super().__init__(storage_dir=storage_dir,
                          num_bins=len(quantile_ranges),
@@ -633,6 +638,7 @@ class QuantileReplayBufferDiskStorage(GeneralBinnedReplayBufferDiskStorage):
                          independent_ages=independent_ages,
                          count_capacity=count_capacity,
                          ignore_zeros=ignore_zeros,
+                         BinBufferClass=BinBufferClass,
                          )
         self.quantile_ranges = []
         for low, high in quantile_ranges:
@@ -829,12 +835,12 @@ if __name__ == '__main__':
         (.5, 1),
         (.75, 1),
     ]
-    test = QuantileReplayBufferDiskStorage(capacity=420,
-                                           storage_dir=storage_dir,
-                                           track_age=False,
-                                           quantile_ranges=quantile_ranges,
-                                           ignore_zeros=False,
-                                           )
+    test = QuantileReplayBuffer(capacity=420,
+                                storage_dir=storage_dir,
+                                track_age=False,
+                                quantile_ranges=quantile_ranges,
+                                ignore_zeros=False,
+                                )
 
     for i in range(10000):
         item = (torch.rand(1).item(), i)

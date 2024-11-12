@@ -2,7 +2,7 @@ import torch, os
 from torch import nn
 from torch.utils.data import DataLoader
 
-from BERTeam.buffer import LangReplayBuffer
+from BERTeam.buffer.language_replay_buffer import LangReplayBuffer, GeneralBinnedReplayBuffer
 
 from BERTeam.networks import TeamBuilder, BERTeam
 from BERTeam.networks import DiscreteInputEmbedder, DiscreteInputPosEmbedder, DiscreteInputPosAppender
@@ -356,6 +356,9 @@ class MLMTeamTrainer(TeamTrainer):
             team: (K,) shape long tensor
             obs_mask: (1,S), which elements of obs to mask, if necessary
             weight: weight to assign to sample
+                should be ONLY inverse probability weighting
+                any outcome information should be in scalar, and any age stuff is calculated upon sampling
+                this allows us to separate BERT and L1 losses
         Returns:
         """
         item = (scalar, obs_preembed, team, obs_mask, weight)
@@ -369,6 +372,8 @@ class MLMTeamTrainer(TeamTrainer):
               mask_obs_prob=.1,
               output_layer_idx=None,
               use_L1_loss=False,
+              entropy_reg=.1,
+              data_iterator=None
               ):
         """
         Args:
@@ -382,12 +387,16 @@ class MLMTeamTrainer(TeamTrainer):
             mask_obs_prob: if >0, randomly masks observations with this probability as well
             output_layer_idx: if specified, use this output layer of BERTeam
             use_L1_loss: whether to use the L1 loss (self.training_step_L1)
+            entropy_reg: entropy regularization to use with L1 loss
+                setting to p means at most p of the optimal distribution is moved from the L1 optimal value,
+                    0 is equiv to L1
         Returns:
             avg loss
         """
         if minibatch is None:
             minibatch = batch_size
-        data_iterator = self._data_sample_iterator(batch_size=batch_size)
+        if data_iterator is None:
+            data_iterator = self._data_sample_iterator(batch_size=batch_size)
         if batch_size is None:
             batch_size = len(self.buffer)
         if not len(self.buffer):
@@ -401,6 +410,7 @@ class MLMTeamTrainer(TeamTrainer):
                 step_loss = self.training_step_L1(
                     batch_size=tinybatch,
                     output_layer_idx=output_layer_idx,
+                    entropy_reg=entropy_reg,
                     data_iterator=data_iterator,
                 )
             else:
@@ -421,11 +431,23 @@ class MLMTeamTrainer(TeamTrainer):
         #    torch.cuda.empty_cache()
         return loss/batch_size
 
-    def _data_sample_iterator(self, batch_size):
-        data = self.buffer.sample(batch=batch_size)
+    def _data_sample_iterator(self, batch_size, sample_kwargs=None):
+        """
+        samples training buffer
+        Args:
+            sample_kwargs: kwargs to feed into self.buffer.sample
+        Returns: iterable of (scalar, obs_preembed, team, obs_mask, weight)
+        Notes: weight is ONLY inverse probabilty weighting
+            the utility should be stored with scalar, and multiplied in the loss step
+            this allows us to better handle both BERT loss with L1 loss
+        """
+        if sample_kwargs is None:
+            sample_kwargs = dict()
+        data = self.buffer.sample(batch=batch_size, **sample_kwargs)
         for item in data:
             if self.buffer.track_age:
                 (scalar, obs_preembed, team, obs_mask, weight), age = item
+                # we decay according to the age to put more weight on recent values
                 if self.weight_decay_half_life is not None:
                     weight = weight*torch.pow(torch.tensor(1/2), age/self.weight_decay_half_life)
             else:
@@ -449,6 +471,11 @@ class MLMTeamTrainer(TeamTrainer):
             we obtain D_T by multiplying the probabilities of choosing each each member one at a time
             we also consider a random permutation to balance out order effects
             we also can clip loss by removing gradients (with max) for increasing a probability past a value
+        weighting:
+            each data point has a 'scalar' and a 'weight'
+            the scalar is the outcome of the game, and the weight is non negative and usually to account for sample bias
+            we weight the loss by scalar*weight. (distinct from BERTeam loss, weighted by just weight)
+                this is because we want each datapoint to be weighted according to their expected outcome
         Args:
             batch_size: batch size
             output_layer_idx: if specified, use this output layer of BERTeam
@@ -505,7 +532,7 @@ class MLMTeamTrainer(TeamTrainer):
                 # unmask the true token
                 temp[0, i] = team[0, i]
             l1loss = (2 - 2*prob)
-            loss_sum += weight*l1loss
+            loss_sum += scalar*weight*l1loss
 
             # max total entropy is obtained when each distribution is uniform, with prob 1/num_agents
             # at this point, entropy is -sum_{num_agents}((1/num_agents) * log(1/num_agents))=-log(1/num_agents)
@@ -545,6 +572,14 @@ class MLMTeamTrainer(TeamTrainer):
             mask_obs_prob: if >0, randomly masks observations with this probability as well
             output_layer_idx: if specified, use this output layer of BERTeam
             data_iterator: iterator over samples, if None, samples from buffer
+        weighting:
+            each data point has a 'scalar' and a 'weight'
+            the scalar is the outcome of the game, and the weight is non negative and usually to account for sample bias
+            we weight the loss by weight. (distinct from L1 loss, weighted by scalar*weight)
+                this is because we want to predict the count of each datapoint as opposed to anything about their occurrence
+                we assume that we formed our dataset so that we are recieving an interesting sample
+                    (i.e., we only consider the best teams in this bin of the dataset)
+                this way, we match a distribution of 'good teams'
         Returns:
             avg losses for whole dataset
         """
@@ -557,7 +592,7 @@ class MLMTeamTrainer(TeamTrainer):
         if data_iterator is None:
             data_iterator = self._data_sample_iterator(batch_size=batch_size)
 
-        for (scalar,
+        for (_,  # scalar is not important here
              obs_preembed,
              team,
              obs_mask,
@@ -1034,6 +1069,70 @@ class DiscreteInputTrainer(MLMTeamTrainer):
             weight_decay_half_life=weight_decay_half_life,
             optimizer_kwargs=optimizer_kwargs,
         )
+
+
+class DualTeamTrainer(MLMTeamTrainer):
+    """
+    trains BERTeam with multiple output layers using both L1 loss and BERTeam loss
+    usually uses the 0th bin for L1 loss, uses the rest for BERTeam loss
+    """
+
+    def __init__(self,
+                 team_builder: TeamBuilder,
+                 buffer: GeneralBinnedReplayBuffer,
+                 storage_dir=None,
+                 weight_decay_half_life=None,
+                 optimizer_kwargs=None,
+                 L1_bins=(0,),
+                 ):
+        """
+        Args:
+            L1_bins: indexes of bins to use L1 loss on
+                defaults to just the 0th
+        """
+        super().__init__(
+            team_builder=team_builder,
+            buffer=buffer,
+            storage_dir=storage_dir,
+            weight_decay_half_life=weight_decay_half_life,
+            optimizer_kwargs=optimizer_kwargs,
+        )
+        # we assume we have an output layer for each quantile range
+        assert team_builder.num_output_layers == len(buffer.num_bins)
+        self.num_quantiles = team_builder.num_output_layers
+        self.L1_bins = L1_bins
+
+    def train(self,
+              batch_size,
+              minibatch=None,
+              mask_probs=None,
+              replacement_probs=(.8, .1, .1),
+              mask_obs_prob=.1,
+              entropy_reg=.1,
+              **kwargs,
+              ):
+        """
+        calls super().train for each quantile/output layer
+        """
+        losses = []
+        for i in range(self.num_quantiles):
+            data_iterator = self._data_sample_iterator(
+                batch_size=batch_size,
+                sample_kwargs={'bindex': i},  # sample from the ith bin
+            )
+            loss = super().train(
+                batch_size=batch_size,
+                minibatch=minibatch,
+                mask_probs=mask_probs,
+                replacement_probs=replacement_probs,
+                mask_obs_prob=mask_obs_prob,
+                output_layer_idx=i,
+                use_L1_loss=(i in self.L1_bins),  # only use L1 loss on these bins
+                data_iterator=data_iterator,
+                entropy_reg=entropy_reg,
+            )
+            losses.append(loss)
+        return losses
 
 
 if __name__ == '__main__':
