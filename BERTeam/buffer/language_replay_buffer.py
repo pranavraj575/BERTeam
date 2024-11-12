@@ -317,11 +317,13 @@ class GeneralBinnedReplayBufferDiskStorage(LangReplayBuffer):
                  track_age=False,
                  independent_ages=True,
                  count_capacity=1e12,
+                 ignore_zeros=True,
                  ):
         """
         Args:
             num_bins: number of bins
             independent_ages: each bin has an independent age
+            ignore_zeros: just pretend zeros do not happen, no reason to have zero weighted elements in dataset
         """
         super().__init__()
         self.bins = [ReplayBufferDiskStorage(storage_dir=None,
@@ -341,6 +343,7 @@ class GeneralBinnedReplayBufferDiskStorage(LangReplayBuffer):
             self.reset_storage_dir(storage_dir=storage_dir)
         self.track_age = track_age
         self.independent_ages = independent_ages
+        self.ignore_zeros = ignore_zeros
 
     def reset_storage_dir(self, storage_dir):
         super().reset_storage_dir(storage_dir=storage_dir)
@@ -375,6 +378,8 @@ class GeneralBinnedReplayBufferDiskStorage(LangReplayBuffer):
         Returns: item that is displaced, or None if no such item
         """
         scalar = item[0]
+        if self.ignore_zeros and scalar == 0:
+            return
         if bindex is not None:
             if self.track_age:
                 if self.independent_ages:
@@ -484,6 +489,7 @@ class BinnedReplayBufferDiskStorage(GeneralBinnedReplayBufferDiskStorage):
                  track_age=False,
                  independent_ages=True,
                  count_capacity=1e12,
+                 ignore_zeros=True,
                  ):
         """
         Args:
@@ -497,6 +503,7 @@ class BinnedReplayBufferDiskStorage(GeneralBinnedReplayBufferDiskStorage):
                     This is intended for a 2 player game where we want to capture outcomes that are better than ties
                         Usually, in an n-player game, the bounds should range [1/n,...,1] to capture outcomes that are
                             better than ties
+            ignore_zeros: just pretend zeros do not happen
         """
         if bounds is None:
             bounds = [1/2, 1]
@@ -507,6 +514,7 @@ class BinnedReplayBufferDiskStorage(GeneralBinnedReplayBufferDiskStorage):
                          track_age=track_age,
                          independent_ages=independent_ages,
                          count_capacity=count_capacity,
+                         ignore_zeros=ignore_zeros,
                          )
         # we should also track the bounds
         self.info['bounds'] = tuple(bounds)
@@ -599,6 +607,7 @@ class QuantileReplayBufferDiskStorage(GeneralBinnedReplayBufferDiskStorage):
                  SorterClass=SortedTree,
                  sorter_capacity=None,
                  ignore_first=10,
+                 ignore_zeros=True,
                  ):
         """
         Args:
@@ -609,6 +618,7 @@ class QuantileReplayBufferDiskStorage(GeneralBinnedReplayBufferDiskStorage):
             SorterClass: SorterClass() should return a Sorter object to insert/remove/search quantiles with
             ignore_first: ignores first n datapoints no matter what to get a better idea of the distribution
                  this prevents weird behavior like the first point always being accepted
+            ignore_zeros: just pretend zeros do not happen
         """
         if quantile_ranges is None:
             quantile_ranges = [((.5, 'o'), (1, 'c'))]
@@ -622,6 +632,7 @@ class QuantileReplayBufferDiskStorage(GeneralBinnedReplayBufferDiskStorage):
                          track_age=track_age,
                          independent_ages=independent_ages,
                          count_capacity=count_capacity,
+                         ignore_zeros=ignore_zeros,
                          )
         self.quantile_ranges = []
         for low, high in quantile_ranges:
@@ -771,6 +782,7 @@ if __name__ == '__main__':
                                          track_age=False,
                                          count_capacity=1000,
                                          bounds=[-1, .25, .5, .75, 1],
+                                         ignore_zeros=False,
                                          )
     sring = ['0123456789abcdefghij'[torch.randint(0, 10, ())] for _ in range(10000)]
     all_items = []
@@ -794,6 +806,7 @@ if __name__ == '__main__':
                                          count_capacity=1000,
                                          bounds=[-1, .25, .5, .75, 1],
                                          independent_ages=False,
+                                         ignore_zeros=False,
                                          )
     sring = ['0123456789abcdefghij'[torch.randint(0, 10, ())] for _ in range(10000)]
     all_items = []
@@ -820,6 +833,7 @@ if __name__ == '__main__':
                                            storage_dir=storage_dir,
                                            track_age=False,
                                            quantile_ranges=quantile_ranges,
+                                           ignore_zeros=False,
                                            )
 
     for i in range(10000):

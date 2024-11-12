@@ -66,11 +66,12 @@ class BERTeam(nn.Module):
             tkwargs.update(trans_kwargs)
         self.transform = Transformer(**tkwargs)
         self.output_layers = [nn.Linear(embedding_dim, num_agents) for _ in range(num_output_layers)]
+        self.num_output_layers = num_output_layers
         self.softmax = nn.Softmax(dim=-1)
         self.primary_output_layer = 0
 
     def set_primary_output_layer(self, output_layer_idx):
-        assert type(output_layer_idx) == int and output_layer_idx >= 0 and output_layer_idx < len(self.output_layers)
+        assert type(output_layer_idx) == int and output_layer_idx >= 0 and output_layer_idx < self.num_output_layers
         self.primary_output_layer = output_layer_idx
 
     def add_cls_tokens(self, target_team):
@@ -157,6 +158,7 @@ class TeamBuilder(nn.Module):
         super().__init__()
         self.input_embedder = input_embedder
         self.berteam = berteam
+        self.num_output_layers = self.berteam.num_output_layers
 
     def forward(self,
                 obs_preembed,
