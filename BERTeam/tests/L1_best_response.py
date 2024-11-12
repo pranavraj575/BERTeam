@@ -22,7 +22,7 @@ if __name__ == '__main__':
     bert_loss = True  # whether to add BERT loss
     entropy_reg = 0.10  # how much to entropy regularize (0. does nothing)
     batch_size = None  # putting None here will always use all of buffer for a stable gradient, otherwise, we will sample
-    epochs = 1500
+    epochs = 1569
     dropout = 0.1
     T = 3
 
