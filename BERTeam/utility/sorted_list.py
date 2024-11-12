@@ -28,8 +28,7 @@ class Sorter:
         if scalars is None:
             scalars = []
         self.info = {
-            'capacity':
-                capacity
+            'capacity': capacity
         }
         self.extend(scalars=scalars)
 
@@ -86,6 +85,11 @@ class Sorter:
         """
         return (self.__getitem__(i) for i in range(self.__len__()))
 
+    def save_info(self, info_path):
+        f = open(info_path, 'wb')
+        pickle.dump(self.info, f)
+        f.close()
+
     def save(self, save_dir):
         """
         save data to folder
@@ -95,22 +99,19 @@ class Sorter:
         f = open(filename, 'wb')
         pickle.dump(list(self.__iter__()), f)
         f.close()
+        self.save_info(os.path.join(save_dir, 'info.pkl'))
 
-        filename = os.path.join(save_dir, 'info.pkl')
-        f = open(filename, 'wb')
-        pickle.dump(self.info, f)
-        f.close()
+    def load_info(self, info_path):
+        f = open(info_path, 'rb')
+        info = pickle.load(f)
+        self.info.update(info)
 
     def load(self, save_dir):
         """
         loads data from folder
         by default, grabs item as iterable, clears self, then loads all data
         """
-
-        filename = os.path.join(save_dir, 'info.pkl')
-        f = open(filename, 'rb')
-        info = pickle.load(f)
-        self.info.update(info)
+        self.load_info(os.path.join(save_dir, 'info.pkl'))
 
         filename = os.path.join(save_dir, 'scalars.pkl')
         f = open(filename, 'rb')
@@ -159,21 +160,35 @@ class AVLNode:
         self.height = 1
         self.left_cnt = 0
         self.right_cnt = 0
+        self.cnt = 1
 
 
 class SortedTree(Sorter):
     """
     AVL tree https://www.geeksforgeeks.org/avl-tree-in-python/
-        added extra data for O(log n) indexing
+        added extra data for O(log n) indexing and increased efficiency for repeat values
+        we assert that there is at most one node representing each value at the end of each operation
+    Note: n is the number of UNIQUE values
+        for data where there are lots of repeats, n will be very small
+        since we usually expect this for games (i.e. 1 for win, 0 for tie, -1 for loss), this is very useful
     O(log n) quantile search
     O(log n) insertion
     O(log n) deletion
     overall complexity of quantile search + inseration + deletion is
     O(log n)
+    space complexity is O(n)
     """
 
-    def __init__(self, scalars=None, capacity=int(1e6)):
+    def __init__(self, scalars=None, capacity=float('inf')):
+        """
+        Args:
+            scalars:
+            capacity: maximum number of values
+                in cases where there are a smallish number of possible outcomes, this can usually be infinite without any problems
+                the only issues would be from literally having numbers too large for python to store, not sure if this is relevant
+        """
         self.root = None
+        self.num_elements = 0
         self.num_nodes = 0
         super().__init__(scalars=scalars, capacity=capacity)
 
@@ -188,17 +203,22 @@ class SortedTree(Sorter):
         return self.height(node.right) - self.height(node.left)
 
     def _insert(self, root, value):
-        # added support of duplicates, we assume value is value-epsilon upon insertion
+        # added support of duplicates
         if not root:
+            self.num_elements += 1  # we added a node with 1 element
             self.num_nodes += 1
             return AVLNode(value)
-        # always insert to the left if equal, this will put the new value in the earliest spot possible
-        elif value <= root.value:
+        elif value < root.value:
             root.left = self._insert(root.left, value)
             root.left_cnt += 1
-        else:
+        elif value > root.value:
             root.right = self._insert(root.right, value)
             root.right_cnt += 1
+        else:
+            # this is a duplicate, just increase the count at root, return
+            root.cnt += 1
+            self.num_elements += 1  # we increased number of elements
+            return root
 
         root.height = 1 + max(self.height(root.left), self.height(root.right))
         balance = self._balance(root)
@@ -207,7 +227,7 @@ class SortedTree(Sorter):
         # if left heavy and we inserted to left of root.left
         # note that in this case we cannot have inserted AT root.left
         # this would make left tree height exactly 1, so no way for balance to be <-1
-        if balance < -1 and value <= root.left.value:  # value <= implies we inserted it to the left
+        if balance < -1 and value < root.left.value:
             return self._rotate_R(root)
 
         # Left rotation
@@ -220,40 +240,53 @@ class SortedTree(Sorter):
             return self._rotate_R(root)
 
         # Right-Left rotation
-        if balance > 1 and value <= root.right.value:
+        if balance > 1 and value < root.right.value:
             root.right = self._rotate_R(root.right)
             return self._rotate_L(root)
 
         return root
 
-    def _delete(self, root, value):
+    def _delete(self, root, value, cnt=1):
         # if value is duplicated in the tree, we just remove any occurence of value, this method is unchanged
         if not root:
             raise Exception('deleting value not in tree')
-            return root
 
         if value < root.value:
-            root.left = self._delete(root.left, value)
-            root.left_cnt -= 1
+            root.left = self._delete(root.left, value, cnt=cnt)
+            root.left_cnt -= cnt
         elif value > root.value:
-            root.right = self._delete(root.right, value)
-            root.right_cnt -= 1
-        else:
+            root.right = self._delete(root.right, value, cnt=cnt)
+            root.right_cnt -= cnt
+        else:  # value==root.value
+            root.cnt -= cnt  # this should never make this <0
+            if root.cnt > 0:
+                # if we have nodes to spare, just delete one and tree structure stays the same
+                self.num_elements -= cnt  # we remove elements
+                return root
+            # otherwise, root.cnt==0 and we must remove root
+            #  if either side is empty, we can simply make the left (resp. right) the new root
             if not root.left:
                 temp = root.right
                 root = None
-                self.num_nodes -= 1  # we remove only the root node
+                self.num_elements -= cnt  # we remove only the root node
+                self.num_nodes -= 1
                 return temp
             elif not root.right:
                 temp = root.left
                 root = None
-                self.num_nodes -= 1  # we remove only the root node
+                self.num_elements -= cnt  # we remove only the root node
+                self.num_nodes -= 1
                 return temp
-
+            # otherwise, we grab the minimum value node on right and make it the root
             temp = self._min_value_node(root.right)
             root.value = temp.value
-            root.right = self._delete(root.right, temp.value)
-            root.right_cnt -= 1
+            root.cnt = temp.cnt
+            # we have removed cnt from root, and added temp.cnt
+            # technically temp.cnt-(cnt+root.cnt), but root.cnt=0
+            self.num_elements += temp.cnt - cnt
+            # we must delete temp.cnt instances of temp.value from the right tree
+            root.right = self._delete(root.right, temp.value, cnt=temp.cnt)
+            root.right_cnt -= temp.cnt
 
         if not root:
             return root
@@ -294,9 +327,9 @@ class SortedTree(Sorter):
         # https://upload.wikimedia.org/wikipedia/commons/thumb/7/76/AVL-simple-left_K.svg/194px-AVL-simple-left_K.svg.png
         # z's right and x's left do not change
         # z+z.right used to be right of x, and now they are not
-        x.right_cnt -= 1 + z.right_cnt
+        x.right_cnt -= z.cnt + z.right_cnt
         # x+x.left are now left of z
-        z.left_cnt += 1 + x.left_cnt
+        z.left_cnt += x.cnt + x.left_cnt
 
         return z
 
@@ -311,9 +344,9 @@ class SortedTree(Sorter):
         z.height = 1 + max(self.height(z.left), self.height(z.right))
 
         # z+z.left used to be left of x and now are not
-        x.left_cnt -= 1 + z.left_cnt
+        x.left_cnt -= z.cnt + z.left_cnt
         # x+x.right are now right of z
-        z.right_cnt += 1 + x.right_cnt
+        z.right_cnt += x.cnt + x.right_cnt
 
         return z
 
@@ -343,22 +376,26 @@ class SortedTree(Sorter):
         return self.search_idx(self.root, item)
 
     def __len__(self):
-        return self.num_nodes
+        return self.num_elements
 
     def search_idx(self, root, idx):
         if idx < root.left_cnt:
             return self.search_idx(root.left, idx)
-        if idx == root.left_cnt:
+        if idx < root.left_cnt + root.cnt:
+            # root.left_cnt <= idx < root.left_cnt + root.cnt
+            #  then we have landed on one of the root.cnt copies of root.value
             return root.value
-        if idx > root.left_cnt:
-            return self.search_idx(root.right, idx - root.left_cnt - 1)  # -1 because of the value in root
+        if idx >= root.left_cnt + root.cnt:
+            return self.search_idx(root.right,
+                                   idx - root.left_cnt - root.cnt,
+                                   )  # -root.cnt because of the values in root
 
     def search_value(self, value):
         return self.search(self.root, value)
 
     def clear(self):
         self.root = None
-        self.num_nodes = 0
+        self.num_elements = 0
 
     def get_iterable(self, node):
         """
@@ -370,7 +407,7 @@ class SortedTree(Sorter):
             return iter(())
         return itertools.chain(
             self.get_iterable(node.left),
-            (node.value,),
+            (node.value for _ in range(node.cnt)),
             self.get_iterable(node.right),
         )
 
@@ -384,16 +421,18 @@ class SortedTree(Sorter):
         """
         surprised this works, looks like pickle grabs the entire tree for quick storage with O(n) space/time
         """
+        self.save_info(os.path.join(save_dir, 'info.pkl'))
         filename = os.path.join(save_dir, 'root.pkl')
         f = open(filename, 'wb')
-        pickle.dump((self.root, self.num_nodes), f)
+        pickle.dump((self.root, self.num_elements, self.num_nodes), f)
         f.close()
 
     def load(self, save_dir):
+        self.load_info(os.path.join(save_dir, 'info.pkl'))
         filename = os.path.join(save_dir, 'root.pkl')
         self.clear()
         f = open(filename, 'rb')
-        self.root, self.num_nodes = pickle.load(f)
+        self.root, self.num_elements, self.num_nodes = pickle.load(f)
         f.close()
 
 
@@ -410,6 +449,7 @@ if __name__ == '__main__':
     n = 10000
     scalars = [int(t.item()) for t in torch.rand(n)*n]
     sl1 = SortedList(scalars=scalars)
+
     sl1.insert(69)
     sl1.remove(scalars[0])
     sl1.remove(scalars[3])
@@ -418,7 +458,7 @@ if __name__ == '__main__':
     sl2.insert(69)
     sl2.remove(scalars[0])
     sl2.remove(scalars[3])
-
+    assert list(sl1) == list(sl2)
     # save test
     save_dir = 'save_sorted_list_test'
     if os.path.exists(save_dir):
@@ -430,15 +470,17 @@ if __name__ == '__main__':
     print(sl2)
     sl3 = SortedTree()
     sl3.load(save_dir)
-    print(len(sl1), len(sl3))
-    assert list(sl1) == list(sl3)
     shutil.rmtree(save_dir)
+    print(len(sl1), len(sl3))
+
+    assert list(sl1) == list(sl3)
 
     # time complexity test
     # time of doing n insertions and removals, starting from empty list
     # it is quite fast for n>=10000, which is a good scale
     n = 50000
-    scalars = [int(t.item()) for t in torch.rand(n)*n]
+    m = 3  # number of unique values, decreaseing this should improve the tree implemnetation, as we love repeats
+    scalars = [int(t.item()) for t in torch.rand(n)*m]
     perm = torch.randperm(n)
     for sl in SortedTree(), SortedList():
         tim = time.time()
