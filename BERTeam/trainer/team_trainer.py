@@ -458,6 +458,9 @@ class MLMTeamTrainer(TeamTrainer):
                          batch_size,
                          output_layer_idx=None,
                          entropy_reg=0.,
+                         entropy_clip_p=None,
+                         entropy_clip_gamma=None,
+                         clip_each_distribution_p=None,
                          data_iterator=None,
                          ):
         """
@@ -480,13 +483,94 @@ class MLMTeamTrainer(TeamTrainer):
             batch_size: batch size
             output_layer_idx: if specified, use this output layer of BERTeam
             entropy_reg: regularizes distribution by encouraging entropy of each conditional distribution
-                adds entropy to overall loss, scaled by entropy_reg
-                we scale to ensure that from the L1 optimizer p*, at most entropy_reg can be moved to make a new optimizer
-                i.e. the new optimizer should be (entropy_reg)-far from a L1 optimizer
+                adds avg entropy of each conditional distribution to overall loss, scaled by entropy_reg
+            entropy_clip_gamma: https://arxiv.org/pdf/1701.06548
+                clips entropy values over gamma, so solutions with high enough entropy wont be penalized
+            entropy_clip_p:
+                calculates gamma (entropy_clip_gamma) as follows for size 1 teams:
+                    assume we devote p of the distribution to maximizing entropy (assume p<(m-1)/m)
+                    then the lowest possible entropy solution is (1-p), p/(m-1),...
+                    let gamma be the entropy of this solution
+                for size k teams, we do the same but set the p of each conditional distribution as
+                        p_cond=1-(1-entropy_clip_p)^{1/k}
+                    so that the lowest entropy solution of always putting 1-p_cond on the maximizer results in
+                        (1-p_cond)^k=1-entropy_clip_p of the total distribution on the maximizer
+            clip_each_distribution_p:
+                clip a distribution so that at least p is sent into maximizing entropy
+                during entropy calculation, takes the min of dist and p/m
+                if team size is 1, adds entropy to only those values under p/m
+                if team size is k, calculates conditional p, than does the same
             data_iterator: iterator over samples, if None, samples from buffer
         Returns:
             avg L1 loss
         """
+
+        def calc_conditional_p(k, p):
+            """
+            calculates p' so that (1-p')^k=1-p
+            if p is None or entropy_reg is 0, just returns p
+            """
+            if (p is not None) and (entropy_reg > 0):
+                return 1 - torch.pow(torch.tensor(1 - p), 1/k)
+            else:
+                return p
+
+        def calc_entropy(dist, clip_each_distribution_p_cond):
+            """
+            calculates entropy of a distribution
+            Args:
+                dist: distribution, (num_agents,)
+                clip_each_distribution_p_cond: p to clip each distribution with, 0 if no clipping
+            Returns:
+                clipped entropy
+            """
+            if entropy_reg > 0:  # dont need to calculate this if reg is 0
+                if clip_each_distribution_p_cond is not None:
+                    # we want at least entropy_clip_p_cond of the distribution to be put into entropy maximization
+                    # then gradients will not be run unless the value of any element is under entropy_clip_p_cond/m
+                    clipped_dist = torch.min(clip_each_distribution_p_cond/self.num_agents, dist)
+                    # now make this a distribution
+                    clipped_dist = clipped_dist/torch.sum(clipped_dist)
+                else:
+                    clipped_dist = dist
+                return -torch.sum(clipped_dist*torch.log(clipped_dist))
+            return 0
+
+        def calc_entropy_reg_term(total_entropy, k, entropy_clip_p_cond=None):
+            """
+            calculates entropy regularization term
+            Args:
+                total_entropy: entropy summed over k conditional probability distributions (members of a team)
+                k: team size
+            Returns:
+                term to add to loss to entropy regularize
+            """
+
+            if ((entropy_clip_gamma is None) and (entropy_clip_p_cond is not None)
+                    and (self.num_agents > 1) and (entropy_reg > 0)):
+                # calculate gamma here
+                lowest_entropy = torch.ones(self.num_agents)*entropy_clip_p_cond/(self.num_agents - 1)
+                lowest_entropy[0] = 1 - entropy_clip_p_cond
+                # multiply by T since T of these are summed
+                gamma_val = k*(-torch.sum(lowest_entropy*torch.log(lowest_entropy)))
+            else:
+                gamma_val = entropy_clip_gamma
+            # max total entropy is obtained when each distribution is uniform, with prob 1/num_agents
+            # at this point, entropy is -sum_{num_agents}((1/num_agents) * log(1/num_agents))=-log(1/num_agents)
+            # summed over each of T distirbutions
+            if entropy_reg > 0:
+                max_entropy = -k*torch.log(torch.tensor([1/self.num_agents]))
+            else:
+                max_entropy = torch.tensor([1.])
+            if (gamma_val is not None) and (entropy_reg > 0):
+                # flipped from https://arxiv.org/pdf/1701.06548, but same idea
+                # do not carry gradients when entropy is greater than gamma_val
+                total_entropy = torch.min(total_entropy, torch.tensor([gamma_val]))
+                # also do this, so that total_entropy/max_total_entropy is on [0, 1]
+                max_entropy = torch.min(max_entropy, torch.tensor([gamma_val]))
+            # maximal bonus is entropy_reg
+            return -entropy_reg*total_entropy/max_entropy
+
         if not len(self.buffer):
             print('WARNING: trying to train on empty buffer')
             return None
@@ -507,7 +591,8 @@ class MLMTeamTrainer(TeamTrainer):
             T = team.size(1)
             perm = torch.randperm(T)
             prob = torch.tensor([1.])
-
+            entropy_clip_p_cond = calc_conditional_p(k=T, p=entropy_clip_p)
+            clip_each_distribution_p_cond = calc_conditional_p(k=T, p=clip_each_distribution_p)
             # will accumulate the sum of the entropies of each conditional distribution
             total_entropy = torch.tensor([0.])
 
@@ -523,29 +608,17 @@ class MLMTeamTrainer(TeamTrainer):
                     output_layer_idx=output_layer_idx,
                 )
                 dist = out[0, i]  # (num_agents,) dist for relevant position
-                if entropy_reg > 0:  # dont need to calculate this if reg is 0
-                    total_entropy += -torch.sum(dist*torch.log(dist))
+                total_entropy += calc_entropy(dist=dist, clip_each_distribution_p_cond=clip_each_distribution_p_cond)
 
-                # clipped probability of choosing the correct token, if we have largerthan an element_clip probability,
-                #  gradients dont flow
                 prob *= dist[team[0, i]]
                 # unmask the true token
                 temp[0, i] = team[0, i]
             l1loss = (2 - 2*prob)
             loss_sum += scalar*weight*l1loss
 
-            # max total entropy is obtained when each distribution is uniform, with prob 1/num_agents
-            # at this point, entropy is -sum_{num_agents}((1/num_agents) * log(1/num_agents))=-log(1/num_agents)
-            # summed over each of T distirbutions
-            max_total_entropy = -T*torch.log(torch.tensor([1/self.num_agents]))
-            # min_entropy is 0, obtained by having a deterministic distribution, since log(1)=0
-            # thus, maximum deviation due to entropy is max_entropy
-
             # gives a 'bonus' for high entropy solutions
-            # maximal bonus is 2*entropy_reg, which is overshadowed by shifting prob by entropy_reg
-            # thus, this incentivizes a shift of at most entropy_reg from the L1 optimizer
-            entropy_reg_loss = -2*entropy_reg*total_entropy/max_total_entropy
-            entropy_reg_sum += abs(weight)*entropy_reg_loss
+            entropy_reg_sum += calc_entropy_reg_term(total_entropy=total_entropy, k=T,
+                                                     entropy_clip_p_cond=entropy_clip_p_cond)
             count += 1
 
         loss = (loss_sum + entropy_reg_sum)/count

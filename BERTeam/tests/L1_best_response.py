@@ -19,29 +19,33 @@ if __name__ == '__main__':
     # L1 loss test for dual output layer
     E = 32  # embedding dim
     bert_loss = True  # whether to add BERT loss
-    entropy_reg = 0.10  # how much to entropy regularize (0. does nothing)
+    entropy_reg = .5  # how much to entropy regularize (0. does nothing), usually should be about the average weight
+    entropy_clip_p = .3  # total distribution entropy clip
+    clip_each_dist_p = None  # manually encourage entropy of each conditional distribution
     batch_size = None  # putting None here will always use all of buffer for a stable gradient, otherwise, we will sample
-    epochs = 1500
+    epochs = 1000
     dropout = 0.1
-    T = 3
 
     # team, weight
     data = [
-        ((0, 0), 2.),
+        ((0, 0), 1.5),
         ((0, 1), 2.),
-        ((1, 0), 2.),
+        ((1, 0), 0.),
         ((1, 1), 1.),
     ]
-    data = [
-        ((0, 0, 0), 0.1),
-        ((0, 0, 1), 0.2),
-        ((0, 1, 0), 1.6),
-        ((0, 1, 1), 0.3),
-        ((1, 0, 0), 0.4),
-        ((1, 0, 1), 0.5),
-        ((1, 1, 0), 0.6),
-        ((1, 1, 1), 0.7),
-    ]
+    if True:
+        data = [
+            ((0, 0, 0), 0.1),
+            ((0, 0, 1), 0.2),
+            ((0, 1, 0), 1.6),
+            ((0, 1, 1), 0.3),
+            ((1, 0, 0), 0.4),
+            ((1, 0, 1), 0.5),
+            ((1, 1, 0), 0.6),
+            ((1, 1, 1), 0.7),
+        ]
+    T = len(data[0][0])
+
     keys = [t for t, w in data]
 
     test = DiscreteInputTrainer(
@@ -89,6 +93,8 @@ if __name__ == '__main__':
                                     )
         l1loss = test.training_step_L1(batch_size=batch_size,
                                        entropy_reg=entropy_reg,
+                                       entropy_clip_p=entropy_clip_p,
+                                       clip_each_distribution_p=clip_each_dist_p,
                                        )
         dist = test.get_total_distribution(T=T)
         dist2 = test.get_total_distribution(T=T, output_layer_idx=1)
