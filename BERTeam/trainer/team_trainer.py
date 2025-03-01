@@ -599,7 +599,7 @@ class MLMTeamTrainer(TeamTrainer):
             temp = self.create_masked_teams(T=T, N=1)
             for i in perm:
                 # out is (1, T, num_agents)
-                out = self.team_builder.forward(
+                cls, out = self.team_builder.forward(
                     obs_preembed=obs_preembed,
                     target_team=temp.clone(),  # clone to avoid gradient errors
                     obs_mask=obs_mask,
@@ -765,13 +765,13 @@ class MLMTeamTrainer(TeamTrainer):
                                                                  mask_prob=mask_prob,
                                                                  replacement_props=replacement_probs,
                                                                  )
-        logits = self.team_builder.forward(obs_preembed=obs_preembed,
-                                           target_team=in_teams,
-                                           obs_mask=obs_mask,
-                                           output_probs=True,
-                                           pre_softmax=True,
-                                           output_layer_idx=output_layer_idx,
-                                           )
+        cls, logits = self.team_builder.forward(obs_preembed=obs_preembed,
+                                                target_team=in_teams,
+                                                obs_mask=obs_mask,
+                                                output_probs=True,
+                                                pre_softmax=True,
+                                                output_layer_idx=output_layer_idx,
+                                                )
         criterion = nn.CrossEntropyLoss()
 
         loss = criterion(logits[mask_indices], teams[mask_indices])
@@ -850,13 +850,13 @@ class MLMTeamTrainer(TeamTrainer):
             init_team = self.create_masked_teams(T=T, N=N)
 
         # (N, T, num_agents)
-        dist = self.team_builder.forward(obs_preembed=obs_preembed,
-                                         target_team=init_team,
-                                         obs_mask=obs_mask,
-                                         output_probs=True,
-                                         pre_softmax=False,
-                                         output_layer_idx=output_layer_idx,
-                                         )
+        cls, dist = self.team_builder.forward(obs_preembed=obs_preembed,
+                                              target_team=init_team,
+                                              obs_mask=obs_mask,
+                                              output_probs=True,
+                                              pre_softmax=False,
+                                              output_layer_idx=output_layer_idx,
+                                              )
         # (N, T)
         conditional_dist = dist[:, :, member]
 
@@ -998,13 +998,13 @@ class MLMTeamTrainer(TeamTrainer):
             indices = torch.where(torch.eq(init_team, self.MASK))
         if len(indices[0]) == 0:
             return None, torch.tensor(1.), torch.tensor(1.)
-        output = self.team_builder.forward(obs_preembed=obs_preembed,
-                                           target_team=init_team,
-                                           obs_mask=obs_mask,
-                                           output_probs=True,
-                                           pre_softmax=False,
-                                           output_layer_idx=output_layer_idx,
-                                           )
+        cls, output = self.team_builder.forward(obs_preembed=obs_preembed,
+                                                target_team=init_team,
+                                                obs_mask=obs_mask,
+                                                output_probs=True,
+                                                pre_softmax=False,
+                                                output_layer_idx=output_layer_idx,
+                                                )
 
         og_dist = output[indices]  # (|indices|, num_agents) multinomial distribution for each index to update
         if noise_model is not None:

@@ -35,7 +35,7 @@ def dist_from_trainer(trainer: DiscreteInputTrainer,
                 target_team = trainer.create_masked_teams(T=2, N=1)
 
                 for idx in order:
-                    full_dist = trainer.team_builder.forward(input_preembedding, target_team, input_mask)
+                    cls, full_dist = trainer.team_builder.forward(input_preembedding, target_team, input_mask)
                     dist = full_dist[0, idx]
                     this_prob *= dist[perm[idx]].item()
                     target_team[0, idx] = perm[idx]

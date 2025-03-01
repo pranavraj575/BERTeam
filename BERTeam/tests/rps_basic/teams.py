@@ -61,17 +61,17 @@ if __name__ == '__main__':
             #                           ignore_observation=True
             #                           )
 
-        init_distribution = trainer.team_builder.forward(obs_preembed=None,
-                                                         target_team=trainer.create_masked_teams(T=1, N=1),
-                                                         obs_mask=None,
-                                                         ).detach().flatten().numpy()
+        cls, init_distribution = trainer.team_builder.forward(obs_preembed=None,
+                                                              target_team=trainer.create_masked_teams(T=1, N=1),
+                                                              obs_mask=None,
+                                                              ).detach().flatten().numpy()
         init_dists.append(init_distribution)
         conditional_dists = []
         for opponent in range(3):
-            dist = trainer.team_builder.forward(obs_preembed=torch.tensor([[opponent]]),
-                                                target_team=trainer.create_masked_teams(T=1, N=1),
-                                                obs_mask=None,
-                                                )
+            cls, dist = trainer.team_builder.forward(obs_preembed=torch.tensor([[opponent]]),
+                                                     target_team=trainer.create_masked_teams(T=1, N=1),
+                                                     obs_mask=None,
+                                                     )
             conditional_dists.append(dist.detach().flatten().numpy())
         cond_dists.append(conditional_dists)
         loss = trainer.train(batch_size=minibatch)

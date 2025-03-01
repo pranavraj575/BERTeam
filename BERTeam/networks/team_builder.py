@@ -80,10 +80,10 @@ class BERTeam(nn.Module):
         Args:
             target_team: (N, T) vector
         Returns:
-            (N, T+1) vector where self.CLS is added to the end of every team
+            (N, T+1) vector where self.CLS is added to the beginning of every team
         """
         (N, T) = target_team.shape
-        return torch.cat((target_team, torch.ones((N, 1), dtype=target_team.dtype)*self.CLS), dim=1)
+        return torch.cat((torch.ones((N, 1), dtype=target_team.dtype)*self.CLS, target_team), dim=1)
 
     def forward(self,
                 input_embedding,
@@ -98,49 +98,64 @@ class BERTeam(nn.Module):
             input_embedding: (N, S, E) shape tensor of input, or None if no input
                 S should be very small, probably the output of embeddings with a more efficient method like LSTM
             target_team: (N, T) shape tensor of team members
-                EACH TEAM SHOULD END WITH A [CLS] token
+                EACH TEAM SHOULD BE WITH A [CLS] token
             input_mask: (N, S) tensor of booleans on whether to mask each input
             output_probs: whether to output the probability of each team member
                 otherwise just outputs the final embedding
             pre_softmax: if True, does not apply softmax to logits
             output_layer_idx: if there are multiple output layers, specify which one to use
         Returns:
-            if output_probs, (N, T, num_agents) probability distribution for each position
-            otherwise, (N, T, embedding_dim) output of transformer model
+            (
+            cls: (N,E) embedding for the whole team,
+            output:
+                if output_probs, (N, T, num_agents) probability distribution for each position
+                otherwise, (N, T, embedding_dim) output of transformer model
+            )
         """
         if output_layer_idx is None:
             output_layer_idx = self.primary_output_layer
         N, T = target_team.shape
 
         # creates a sequence of size S+1
-        # dimensions (N, S+1, E) where we add embeddings of [CLS2] tokens for the last values
+        # add to input embedding (N,S,E) to get (N, S+1, E) where embeddings of [CLS2] tokens are the first values
+        # we create an array sized (N,1,E), where all N of the tokens are [CLS2]
+        cls2_tokens = self.agent_embedding(torch.fill(torch.zeros((N, 1), dtype=target_team.dtype), self.CLS2))
         if input_embedding is None:
-            source = self.agent_embedding(torch.fill(torch.zeros((N, 1), dtype=target_team.dtype), self.CLS2))
+            # in this case, S=0, so our desried (N,1,E) array is just N copies of the [CLS2] tokens
             S = 0
+            source = cls2_tokens
         else:
-            source = torch.cat((
-                input_embedding,
-                self.agent_embedding(torch.fill(torch.zeros((N, 1), dtype=target_team.dtype), self.CLS2)),), dim=1)
+            # in this case, we concatenate the (N,S,E) array with the (N,1,E) array to get (N,S+1,E)
             N, S, _ = input_embedding.shape
+            source = torch.cat((input_embedding, cls2_tokens,), dim=1)
+        # update input mask from (N,S) boolean array to (N,S+1) to match the extra [CLS2] token
         if input_mask is None:
+            # if no input mask is given, start by masking nothing (all zeros)
             input_mask = torch.zeros((N, S), dtype=torch.bool)
+        # concatenate (N,S) array with (N,1) to get (N,S+1), we also append all zeros since we dont want to mask [CLS2]
         input_mask = torch.cat((input_mask, torch.zeros((N, 1), dtype=torch.bool)), dim=1)
 
-        target = self.agent_embedding(target_team)
+        target = self.agent_embedding(self.add_cls_tokens(target_team))
         pos_enc_target = self.pos_encoder(target)
+        # shaped (N,T+1,E), with [CLS] token at the beginning
 
-        output = self.transform.forward(src=source,
-                                        tgt=pos_enc_target,
-                                        src_key_padding_mask=input_mask,
-                                        memory_key_padding_mask=input_mask,
-                                        )
+        model_output = self.transform.forward(src=source,
+                                              tgt=pos_enc_target,
+                                              src_key_padding_mask=input_mask,
+                                              memory_key_padding_mask=input_mask,
+                                              )
+        # (N,T+1,E), same as tgt
+
+        # split into cls (N,E) and output corresponding to sequence (N,T,E)
+        cls, output = model_output[:, 0, :], model_output[:, 1:, :]
         if output_probs:
+            # if we want a distribution, apply the correct output layer onto the output embedding
             output_layer = self.output_layers[output_layer_idx]
             output = output_layer.forward(output)
             if not pre_softmax:
                 output = self.softmax.forward(output)
 
-        return output
+        return cls, output
 
 
 class TeamBuilder(nn.Module):
@@ -172,16 +187,19 @@ class TeamBuilder(nn.Module):
         Args:
             obs_preembed: (N, S, *) shape tensor of input, or None if no input
             target_team: (N, T) shape tensor of team members
-                EACH TEAM SHOULD END WITH A [CLS] token
             obs_mask: (N, S) tensor of booleans on whether to mask each input
             output_probs: whether to output the probability of each team member
                 otherwise just outputs the final embedding
             pre_softmax: if True, does not apply softmax to logits
             output_layer_idx: if specified, use this output layer
                 else use the default (0)
-        Returns:
-            if output_probs, (N, T, num_agents) probability distribution for each position
-            otherwise, (N, T, embedding_dim) output of transformer model
+        Returns: same as BERTeam.forward
+            (
+            cls: (N,E) embedding for the whole team,
+            output:
+                if output_probs, (N, T, num_agents) probability distribution for each position
+                otherwise, (N, T, embedding_dim) output of transformer model
+            )
         """
         if obs_preembed is None:
             obs_embed = None
@@ -203,30 +221,40 @@ if __name__ == '__main__':
     T = 5
     E = 16
 
-    test = Transformer(d_model=E, batch_first=True)
-    s = torch.rand((N, S, E))
-    s[0, 0, :] = 100.
-
-    t = torch.rand((N, T, E))
-    test.forward(src=s, tgt=t)
-
-    test = BERTeam(num_agents=69, embedding_dim=E, dropout=0)
+    test = BERTeam(num_agents=69, embedding_dim=E, dropout=0)  # remove randomness
 
     team = torch.randint(0, test.num_agents, (N, T))
-    team = test.add_cls_tokens(team)
 
-    obs_preembed = torch.rand((N, S, E))
+    obs_preembeda = torch.rand((N, S, E))
+    # mask everything except for first element
     obs_mask = torch.ones((N, S), dtype=torch.bool)
     obs_mask[:, 0] = False
 
-    a = test.forward(input_embedding=obs_preembed,
-                     target_team=team,
-                     input_mask=obs_mask
-                     )
-    obs_preembed[:, 1] *= 10
-    b = test.forward(input_embedding=obs_preembed,
-                     target_team=team,
-                     input_mask=obs_mask,
-                     )
+    # use/dont use obs_mask
+    clsa, outputa = test.forward(input_embedding=obs_preembeda,
+                                 target_team=team,
+                                 input_mask=obs_mask,
+                                 )
+    clsa_unmsk, outputa_unmsk = test.forward(input_embedding=obs_preembeda,
+                                             target_team=team,
+                                             input_mask=None,
+                                             )
 
-    assert torch.all(a == b)
+    # everything is different except for first element
+    obs_preembedb = torch.rand((N, S, E))
+    obs_preembedb[:, 0] = obs_preembeda[:, 0]
+    clsb, outputb = test.forward(input_embedding=obs_preembedb,
+                                 target_team=team,
+                                 input_mask=obs_mask,
+                                 )
+    clsb_unmsk, outputb_unmsk = test.forward(input_embedding=obs_preembedb,
+                                             target_team=team,
+                                             input_mask=None,
+                                             )
+    # the masked values should be the same
+    assert torch.all(outputa == outputb)
+    assert torch.all(clsa == clsb)
+
+    # the unmasked values do not have to be the same
+    print('expected false:', torch.all(outputa_unmsk == outputb_unmsk).item())
+    print('expected false:', torch.all(clsa_unmsk == clsb_unmsk).item())
